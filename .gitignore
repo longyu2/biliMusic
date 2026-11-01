@@ -1,0 +1,13 @@
+# 运行时数据：收藏夹快照、播放进度、历史、封面缓存，都不入库
+data/
+
+# 依赖
+node_modules/
+
+# 桌面端构建产物
+desktop/dist/
+
+# 杂项
+*.log
+.DS_Store
+Thumbs.db

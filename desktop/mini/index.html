@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src http: https: data:; style-src 'unsafe-inline'; script-src 'unsafe-inline';" />
+<title>mini</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    font-family: "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+    user-select: none;
+    cursor: default;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* 窗口比卡片大一圈，四周 6px 留给阴影，不然会被裁掉 */
+  .card {
+    position: absolute;
+    inset: 6px;
+    border-radius: 16px;
+    background: rgba(17, 14, 23, 0.94);
+    border: 1px solid rgba(255, 255, 255, 0.085);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px 14px;
+    overflow: hidden;
+    /* 整块都能拖窗口；按钮单独设 no-drag */
+    -webkit-app-region: drag;
+  }
+
+  .art {
+    width: 58px;
+    height: 58px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: #1b1722 center / cover no-repeat;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow: 0 0 18px 2px rgba(0, 0, 0, 0.5);
+    animation: spin 26s linear infinite;
+    animation-play-state: paused;
+  }
+  .art.playing { animation-play-state: running; }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .meta {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #f1eff5;
+    line-height: 1.25;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .sub {
+    font-size: 11px;
+    color: #8b8797;
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .btns {
+    display: flex;
+    align-items: center;
+    gap: 1px;
+    flex-shrink: 0;
+    -webkit-app-region: no-drag;
+  }
+
+  button {
+    width: 30px;
+    height: 30px;
+    border: 0;
+    background: transparent;
+    color: #c9c5d4;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, transform 0.08s;
+  }
+  button:hover { background: rgba(255, 255, 255, 0.09); color: #fff; }
+  button:active { transform: scale(0.92); }
+
+  button.play {
+    width: 34px;
+    height: 34px;
+    background: #fb7299;
+    color: #fff;
+  }
+  button.play:hover { background: #ff86ab; }
+
+  /* 右上角回到主窗口 */
+  .expand {
+    position: absolute;
+    top: 7px;
+    right: 8px;
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+    color: rgba(255, 255, 255, 0.32);
+    -webkit-app-region: no-drag;
+    opacity: 0;
+    transition: opacity 0.15s, color 0.15s;
+  }
+  .card:hover .expand { opacity: 1; }
+  .expand:hover { color: #fff; background: rgba(255, 255, 255, 0.1); }
+
+  .bar {
+    position: absolute;
+    left: 14px;
+    right: 14px;
+    bottom: 8px;
+    height: 2px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.1);
+    overflow: hidden;
+  }
+  .bar i {
+    display: block;
+    height: 100%;
+    width: 0;
+    border-radius: 2px;
+    background: linear-gradient(90deg, #fb7299, #a78bfa);
+    transition: width 0.25s linear;
+  }
+
+  .hide { display: none !important; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="art" id="art"></div>
+
+    <div class="meta">
+      <div class="title" id="title">未在播放</div>
+      <div class="sub" id="sub">在播放器里点一首歌开始</div>
+    </div>
+
+    <div class="btns">
+      <button id="prev" title="上一首">
+        <svg viewBox="0 0 24 24" width="15" height="15"><path d="M17 5 L7 12 L17 19 Z" fill="currentColor"/><rect x="4.2" y="5" width="1.9" height="14" rx="0.9" fill="currentColor"/></svg>
+      </button>
+      <button id="play" class="play" title="播放 / 暂停">
+        <svg id="icoPlay" viewBox="0 0 24 24" width="15" height="15"><path d="M8 5 L19 12 L8 19 Z" fill="currentColor"/></svg>
+        <svg id="icoPause" class="hide" viewBox="0 0 24 24" width="15" height="15"><rect x="6.5" y="5" width="3.6" height="14" rx="1.2" fill="currentColor"/><rect x="13.9" y="5" width="3.6" height="14" rx="1.2" fill="currentColor"/></svg>
+      </button>
+      <button id="next" title="下一首">
+        <svg viewBox="0 0 24 24" width="15" height="15"><path d="M7 5 L17 12 L7 19 Z" fill="currentColor"/><rect x="17.9" y="5" width="1.9" height="14" rx="0.9" fill="currentColor"/></svg>
+      </button>
+    </div>
+
+    <button id="expand" class="expand" title="回到主窗口">
+      <svg viewBox="0 0 24 24" width="12" height="12"><path d="M14 4h6v6M20 4l-7 7M10 20H4v-6M4 20l7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+
+    <div class="bar"><i id="fill"></i></div>
+  </div>
+
+<script>
+  const $ = (s) => document.querySelector(s);
+  const api = window.mini;
+
+  let st = { title: '', upper: '', cover: '', playing: false, pos: 0, dur: 0 };
+  let stamp = 0; // 收到状态的时刻，用来本地插值推进度
+
+  const fmt = (sec) => {
+    if (!Number.isFinite(sec) || sec < 0) sec = 0;
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return m + ':' + String(s).padStart(2, '0');
+  };
+
+  function render() {
+    $('#title').textContent = st.title || '未在播放';
+    const bits = [];
+    if (st.upper) bits.push(st.upper);
+    if (st.dur > 0) bits.push(fmt(st.pos) + ' / ' + fmt(st.dur));
+    $('#sub').textContent = bits.join(' · ') || '在播放器里点一首歌开始';
+
+    if (st.cover) {
+      $('#art').style.backgroundImage = 'url("' + st.cover + '")';
+    } else {
+      $('#art').style.backgroundImage = '';
+    }
+    $('#art').classList.toggle('playing', !!st.playing);
+    $('#icoPlay').classList.toggle('hide', !!st.playing);
+    $('#icoPause').classList.toggle('hide', !st.playing);
+  }
+
+  // 主进程每秒只推一次状态，进度条靠本地插值才不会一跳一跳
+  function tick() {
+    if (st.dur > 0) {
+      const pos = st.playing
+        ? Math.min(st.dur, st.pos + (performance.now() - stamp) / 1000)
+        : st.pos;
+      $('#fill').style.width = (pos / st.dur) * 100 + '%';
+      const t = fmt(pos) + ' / ' + fmt(st.dur);
+      if ($('#sub').textContent.indexOf('/') >= 0) {
+        $('#sub').textContent = (st.upper ? st.upper + ' · ' : '') + t;
+      }
+    }
+    requestAnimationFrame(tick);
+  }
+
+  if (api) {
+    api.onState((s) => {
+      st = Object.assign(st, s || {});
+      stamp = performance.now();
+      render();
+    });
+
+    $('#play').addEventListener('click', () => api.command('toggle'));
+    $('#prev').addEventListener('click', () => api.command('prev'));
+    $('#next').addEventListener('click', () => api.command('next'));
+    $('#expand').addEventListener('click', () => api.expand());
+  }
+
+  tick();
+</script>
+</body>
+</html>

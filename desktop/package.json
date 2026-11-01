@@ -1,0 +1,62 @@
+{
+  "name": "bili-fav-music",
+  "productName": "b站音乐播放器",
+  "version": "1.0.0",
+  "description": "b站音乐播放器（内网）",
+  "main": "main.js",
+  "author": "longyu",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis portable"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "cn.misaka-mikoto.bilifavmusic",
+    "productName": "b站音乐播放器",
+    "copyright": "longyu",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "icon.png",
+      "error/**/*",
+      "mini/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "b站音乐播放器",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "b站音乐播放器-安装版-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "b站音乐播放器-便携版.exe",
+      "requestExecutionLevel": "user"
+    }
+  }
+}

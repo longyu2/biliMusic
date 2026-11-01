@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>b站音乐播放器</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #0d0a10;
+    color: #fff;
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    -webkit-user-select: none;
+    user-select: none;
+    overflow: hidden;
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding-top: 36px;
+    box-sizing: border-box;
+    background:
+      radial-gradient(900px 520px at 22% 18%, rgba(251, 114, 153, 0.16), transparent 62%),
+      radial-gradient(900px 520px at 80% 82%, rgba(56, 189, 248, 0.12), transparent 62%),
+      #0d0a10;
+  }
+  /* 顶部拖动条，和窗口按钮所在的那一条对齐 */
+  body::before {
+    content: "";
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 36px;
+    background: #0d0a10;
+    -webkit-app-region: drag;
+    z-index: 9;
+  }
+  .card {
+    width: min(520px, 88vw);
+    padding: 40px 36px 34px;
+    border-radius: 22px;
+    background: rgba(255, 255, 255, 0.045);
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+    text-align: center;
+    -webkit-app-region: drag;
+  }
+  img {
+    width: 78px;
+    height: 78px;
+    border-radius: 18px;
+    box-shadow: 0 12px 30px rgba(251, 114, 153, 0.35);
+  }
+  h1 {
+    font-size: 19px;
+    font-weight: 600;
+    margin: 20px 0 8px;
+    letter-spacing: 0.3px;
+  }
+  p {
+    margin: 0;
+    font-size: 13.5px;
+    line-height: 1.75;
+    color: rgba(255, 255, 255, 0.6);
+  }
+  .url {
+    display: inline-block;
+    margin-top: 14px;
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 12.5px;
+    color: #fb7299;
+    background: rgba(251, 114, 153, 0.1);
+    border: 1px solid rgba(251, 114, 153, 0.22);
+    -webkit-user-select: text;
+    user-select: text;
+  }
+  .detail {
+    margin-top: 12px;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.3);
+    min-height: 16px;
+    word-break: break-all;
+  }
+  .btns {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    margin-top: 26px;
+    -webkit-app-region: no-drag;
+  }
+  button {
+    font: inherit;
+    font-size: 14px;
+    padding: 11px 26px;
+    border-radius: 11px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.07);
+    color: rgba(255, 255, 255, 0.85);
+    cursor: pointer;
+    transition: background 0.15s, transform 0.08s, border-color 0.15s;
+  }
+  button:hover { background: rgba(255, 255, 255, 0.13); }
+  button:active { transform: scale(0.97); }
+  button.primary {
+    background: linear-gradient(135deg, #ff9ab5, #fb7299);
+    border-color: transparent;
+    color: #2a0b16;
+    font-weight: 600;
+  }
+  button.primary:hover { background: linear-gradient(135deg, #ffaec4, #fc84a7); }
+  .hint {
+    margin-top: 18px;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.28);
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <img src="icon.png" alt="" />
+    <h1>连不上音乐服务器</h1>
+    <p>请确认这台电脑和服务器在同一个内网，<br />并且服务器上的播放器正在运行。</p>
+    <div class="url" id="url">—</div>
+    <div class="detail" id="detail"></div>
+    <div class="btns">
+      <button class="primary" id="retry">重试</button>
+      <button id="quit">退出</button>
+    </div>
+    <div class="hint" id="hint">6 秒后自动重试</div>
+  </div>
+
+<script>
+  const q = new URLSearchParams(location.search);
+  document.getElementById('url').textContent = q.get('url') || '';
+  document.getElementById('detail').textContent = q.get('detail') || '';
+
+  const retry = () => window.appBridge && window.appBridge.retry();
+  document.getElementById('retry').addEventListener('click', retry);
+  document.getElementById('quit').addEventListener('click', () => {
+    window.appBridge && window.appBridge.quit();
+  });
+
+  let left = 6;
+  const hint = document.getElementById('hint');
+  setInterval(() => {
+    left -= 1;
+    if (left <= 0) {
+      retry();
+      return;
+    }
+    hint.textContent = left + ' 秒后自动重试';
+  }, 1000);
+</script>
+</body>
+</html>
