@@ -18,12 +18,28 @@ const path = require('path');
 const crypto = require('crypto');
 const { Readable } = require('stream');
 
+/* ------------------------------------------------------------------ */
+/* 运行形态探测：源码运行 vs 打包成单文件 exe（Node SEA）                 */
+/* ------------------------------------------------------------------ */
+
+// 打包成 exe 后静态资源内嵌在可执行文件里，没有 public 目录可读
+let SEA = null;
+try {
+  SEA = require('node:sea');
+  if (typeof SEA.isSea !== 'function' || !SEA.isSea()) SEA = null;
+} catch {
+  SEA = null;
+}
+
+// SEA 下 __dirname 指向 exe 所在目录，data/ 就落在旁边（解压即用）
+const BASE_DIR = SEA ? path.dirname(process.execPath) : __dirname;
+
 const PORT = Number(process.env.PORT) || 7788;
 // 默认只监听本机；部署到服务器时用 HOST=0.0.0.0 让局域网可访问
 const HOST = process.env.HOST || '127.0.0.1';
-const PUBLIC_DIR = path.join(__dirname, 'public');
+const PUBLIC_DIR = path.join(BASE_DIR, 'public');
 // 收藏夹列表存服务端文件，换设备/换浏览器都能看到同一份
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR || path.join(BASE_DIR, 'data');
 const LIBRARY_FILE = path.join(DATA_DIR, 'library.json');
 // 每个收藏夹的歌单单独存一份，打开时直接读盘，不用再去 B 站翻页
 const FAV_DIR = path.join(DATA_DIR, 'fav');
@@ -670,8 +686,37 @@ function recordHistory(rec) {
 function serveStatic(req, res, pathname) {
   let rel = decodeURIComponent(pathname);
   if (rel === '/' || rel === '') rel = '/index.html';
+  rel = path.normalize(rel).replace(/^(\.\.[/\\])+/, '');
 
-  const filePath = path.join(PUBLIC_DIR, path.normalize(rel).replace(/^(\.\.[/\\])+/, ''));
+  // 单文件 exe：资源在可执行文件内部，按 key 取出来直接吐
+  if (SEA) {
+    const key = 'public' + rel.replace(/\\/g, '/');
+    let buf = null;
+    try {
+      // 注意：第二个参数会交给 TextDecoder，'binary' 不是合法编码名会抛 RangeError。
+      // 不传则直接返回 ArrayBuffer，正是要的东西。
+      const ab = SEA.getAsset(key);
+      if (ab) buf = Buffer.from(ab);
+    } catch (e) {
+      if (process.env.DEBUG_ASSET) console.error('[asset] 读取失败', key, e && e.message);
+      buf = null;
+    }
+    if (process.env.DEBUG_ASSET) {
+      console.error('[asset]', key, buf ? `${buf.length}B` : 'MISS');
+    }
+    if (!buf) {
+      if (rel === '/index.html') return sendText(res, 500, '缺少内嵌的 index.html');
+      return sendText(res, 404, 'not found');
+    }
+    res.writeHead(200, {
+      'Content-Type': MIME[path.extname(rel).toLowerCase()] || 'application/octet-stream',
+      'Content-Length': buf.length,
+      'Cache-Control': 'no-cache',
+    });
+    return res.end(buf);
+  }
+
+  const filePath = path.join(PUBLIC_DIR, rel);
   if (!filePath.startsWith(PUBLIC_DIR)) return sendText(res, 403, 'forbidden');
 
   fs.readFile(filePath, (err, buf) => {

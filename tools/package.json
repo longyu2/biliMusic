@@ -1,0 +1,8 @@
+{
+  "name": "bilimusic-build-tools",
+  "private": true,
+  "description": "build-time only: postject for Node SEA injection",
+  "devDependencies": {
+    "postject": "^1.0.0-alpha.6"
+  }
+}

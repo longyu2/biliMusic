@@ -73,16 +73,39 @@ pm2 save
 
 `ecosystem.config.js` 里已经配好 `HOST=0.0.0.0`、`PORT=7788`、`max_memory_restart=300M`。
 
+### 不想装 Node：用单文件 exe
+
+到 [Releases](https://github.com/longyu2/biliMusic/releases) 下 `biliMusic-<版本>-win-x64.zip`，
+解压后双击 `biliMusic.exe` 就能用，**目标机器不需要装 Node，也不需要联网装任何依赖**。
+
+原理是用 Node 22 的 SEA（Single Executable Application）：把 `server.js` 和整个 `public/`
+打包成一个 blob，注入到 `node.exe` 的 PE 资源段里，产出一个约 83 MB 的独立可执行文件。
+运行时静态资源直接从 exe 内部按 key 取，`data/` 会建在 exe 同目录下，拷走整个文件夹即完成迁移。
+
+自己构建：
+
+```bash
+cd tools && npm install && cd ..   # 只装构建期的 postject，不是运行时依赖
+node build-release.js              # 产物在 release/
+node build-release.js --no-zip     # 只要文件夹，不打 zip
+```
+
+> 坑：`sea.getAsset(key, 'binary')` 的第二个参数会交给 `TextDecoder`，而 `'binary'` 不是
+> 合法编码名，会抛 `RangeError` 并被静默吞掉，表现为「所有静态资源 404」。
+> 不传第二个参数才是正确的——它直接返回 `ArrayBuffer`。
+
 ---
 
 ## 目录结构
 
 ```
 biliMusic/
-├── server.js              # 服务端，零依赖（893 行）
+├── server.js              # 服务端，零依赖
+├── build-release.js       # 构建单文件 exe（Node SEA）
+├── tools/                 # 构建期依赖（postject），不入库
 ├── public/                # 前端，原生 JS，无构建
 │   ├── index.html
-│   ├── app.js             # 全部逻辑（1610 行）
+│   ├── app.js             # 全部逻辑
 │   ├── style.css
 │   └── icons/
 ├── desktop/               # Electron 桌面壳
