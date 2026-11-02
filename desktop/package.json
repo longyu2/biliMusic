@@ -52,7 +52,7 @@
       "shortcutName": "b站音乐播放器",
       "runAfterFinish": true,
       "deleteAppDataOnUninstall": false,
-      "artifactName": "b站音乐播放器-安装版-${version}.${ext}"
+      "artifactName": "biliMusic-desktop-setup-${version}.${ext}"
     },
     "portable": {
       "artifactName": "b站音乐播放器-便携版.exe",

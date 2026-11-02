@@ -3,7 +3,16 @@ const path = require('path');
 const fs = require('fs');
 
 const APP_TITLE = 'b站音乐播放器';
-const DEFAULT_URL = 'http://192.168.1.3:7788/';
+// 默认连本机服务（和单文件版 biliMusic.exe 配套使用）
+const DEFAULT_URL = 'http://localhost:7788/';
+// 早期版本默认连内网服务器。老用户升级后 config.json 里还留着旧地址，
+// 光改默认值没用，得在读取时把它们自动迁过来。
+const LEGACY_URLS = [
+  'http://192.168.1.3:7788/',
+  'http://192.168.1.3:7788',
+  'https://music.misaka-mikoto.cn:10000/',
+  'https://music.misaka-mikoto.cn:10000',
+];
 
 /* ---------------- 启动耗时打点 ---------------- */
 // 设 APP_TIMING=<文件路径> 就会把各阶段时间写进去，平时零开销
@@ -60,7 +69,17 @@ function loadConfig() {
   try {
     const c = JSON.parse(fs.readFileSync(userFile('config.json'), 'utf8'));
     if (c && typeof c.url === 'string' && /^https?:\/\//i.test(c.url.trim())) {
-      targetUrl = c.url.trim();
+      let url = c.url.trim();
+      // 老的默认地址（内网/外网）自动迁移到本机，用户不用手动改配置
+      if (LEGACY_URLS.includes(url)) {
+        url = DEFAULT_URL;
+        try {
+          fs.writeFileSync(userFile('config.json'), JSON.stringify({ url }, null, 2), 'utf8');
+        } catch {
+          /* 写不进去也不影响这次启动 */
+        }
+      }
+      targetUrl = url;
     }
   } catch {
     try {

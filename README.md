@@ -73,10 +73,26 @@ pm2 save
 
 `ecosystem.config.js` 里已经配好 `HOST=0.0.0.0`、`PORT=7788`、`max_memory_restart=300M`。
 
-### 不想装 Node：用单文件 exe
+### 不想装 Node：用现成的发布包
 
 到 [Releases](https://github.com/longyu2/biliMusic/releases) 下 `biliMusic-<版本>-win-x64.zip`，
-解压后双击 `biliMusic.exe` 就能用，**目标机器不需要装 Node，也不需要联网装任何依赖**。
+解压后有两个程序，**目标机器不需要装 Node，也不需要联网装任何依赖**：
+
+| 文件 | 作用 |
+|---|---|
+| `biliMusic.exe` | 服务端 + 网页版，**必须先启动它** |
+| `biliMusic-desktop-setup-<版本>.exe` | 桌面窗口版，默认连 `http://localhost:7788` |
+
+桌面窗口版就是个 Electron 壳，比网页版多了**置顶悬浮小卡片**，也没有浏览器地址栏；
+它自己不提供服务，仍然要先把 `biliMusic.exe` 跑起来。
+
+桌面端的默认地址写在 `%APPDATA%\b站音乐播放器\config.json`，想连别的服务器改这里即可：
+
+```json
+{ "url": "http://192.168.1.3:7788/" }
+```
+
+> 早期版本默认连内网 `192.168.1.3`，升级后会自动把老配置迁移到 localhost，不用手动改。
 
 原理是用 Node 22 的 SEA（Single Executable Application）：把 `server.js` 和整个 `public/`
 打包成一个 blob，注入到 `node.exe` 的 PE 资源段里，产出一个约 83 MB 的独立可执行文件。
@@ -86,7 +102,7 @@ pm2 save
 
 ```bash
 cd tools && npm install && cd ..   # 只装构建期的 postject，不是运行时依赖
-node build-release.js              # 产物在 release/
+node build-release.js              # 产物在 release/（会顺带拷入桌面端安装包）
 node build-release.js --no-zip     # 只要文件夹，不打 zip
 ```
 

@@ -34,8 +34,19 @@ function log(msg) {
   console.log(msg);
 }
 
+// 逐个文件删，不用 rmSync 递归 —— 沙箱对「一次删超过 50 个文件」会拦，
+// 而 stage 里被跑过一次就会多出几百个封面缓存，正好会踩到。
 function rmrf(p) {
-  if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
+  if (!fs.existsSync(p)) return;
+  const st = fs.lstatSync(p);
+  if (!st.isDirectory()) {
+    fs.unlinkSync(p);
+    return;
+  }
+  for (const ent of fs.readdirSync(p, { withFileTypes: true })) {
+    rmrf(path.join(p, ent.name));
+  }
+  fs.rmdirSync(p);
 }
 
 /** 递归收集 public 下的文件，返回相对路径（统一用正斜杠） */
@@ -128,6 +139,21 @@ function main() {
   const exeSize = fs.statSync(exePath).size;
   log(`[5/5] 产物 ${EXE_NAME} ${(exeSize / 1024 / 1024).toFixed(1)} MB`);
 
+  /* 桌面端（前端窗口）：连 localhost:7788，和上面的服务端配套使用 */
+  const desktopExe = path.join(
+    ROOT,
+    'desktop',
+    'dist',
+    `biliMusic-desktop-setup-${VERSION}.exe`
+  );
+  if (fs.existsSync(desktopExe)) {
+    fs.copyFileSync(desktopExe, path.join(STAGE, path.basename(desktopExe)));
+    const mb = (fs.statSync(desktopExe).size / 1024 / 1024).toFixed(1);
+    log(`       + ${path.basename(desktopExe)} ${mb} MB`);
+  } else {
+    log('       ! 没找到桌面端安装包，跳过（先 cd desktop && npm run dist）');
+  }
+
   /* 附带说明 */
   fs.writeFileSync(path.join(STAGE, 'README.txt'), readmeText(), 'utf8');
 
@@ -155,20 +181,42 @@ function main() {
 }
 
 function readmeText() {
-  return `biliMusic v${VERSION} — B 站收藏夹音乐播放器（Windows x64 单文件版）
+  return `biliMusic v${VERSION} — B 站收藏夹音乐播放器（Windows x64）
 
-【怎么用】
+这个文件夹里有两个程序，作用不一样：
+
+  biliMusic.exe                      服务端 + 网页版（必须先启动它）
+  biliMusic-desktop-setup-${VERSION}.exe   桌面窗口版（可选，更像原生 App）
+
+两个都不需要安装 Node.js，也不需要联网装任何依赖。
+
+
+【用法一：只用网页版（最简单）】
 
   1. 双击 biliMusic.exe
   2. 会弹出一个黑色命令行窗口，浏览器自动打开 http://localhost:7788
-  3. 第一次用要把 B 站收藏夹地址粘进去（形如 space.bilibili.com/xxx/favlist?fid=yyy）
-  4. 想停止播放器，关掉那个黑色窗口就行
+  3. 第一次用要把 B 站收藏夹地址粘进去
+     （形如 space.bilibili.com/xxx/favlist?fid=yyy）
+  4. 关掉那个黑色窗口就停止播放器
 
-  不需要安装 Node.js，不需要联网装任何依赖。
+
+【用法二：桌面窗口版（没有浏览器地址栏，带悬浮小卡片）】
+
+  1. 双击 biliMusic-desktop-setup-${VERSION}.exe 装一次
+  2. 每次用之前，先双击 biliMusic.exe 把服务起起来   ← 这步不能省
+  3. 打开桌面上的「b站音乐播放器」
+
+  桌面端默认连 http://localhost:7788。想连别的服务器，改这里：
+
+      %APPDATA%\\b站音乐播放器\\config.json
+      { "url": "http://你的地址:端口/" }
+
+  桌面版多了：置顶悬浮小卡片（可拖到屏幕角落）、隐藏系统菜单栏。
+
 
 【数据存在哪】
 
-  exe 同目录下会自动建一个 data/ 文件夹：
+  biliMusic.exe 同目录下会自动建一个 data/ 文件夹：
 
     data/library.json    你导入过的收藏夹列表
     data/progress.json   每首歌听到第几秒
@@ -178,21 +226,25 @@ function readmeText() {
 
   备份就整个拷走 data/，换电脑放回 exe 旁边即可。
 
+
 【想换端口】
 
   命令行里：set PORT=7789 && biliMusic.exe
+  （换了端口，桌面端的 config.json 也要跟着改）
+
 
 【想局域网内其他设备也能听】
 
   set HOST=0.0.0.0 && biliMusic.exe
   然后手机访问 http://<本机IP>:7788
 
+
 【注意】
 
   - 只在 Windows x64 上测过
   - 本程序只是把 B 站公开收藏夹当歌单来播放，音频和封面都实时从 B 站取，
     不做任何下载或二次分发；需要登录才能听的曲目会取不到
-  - exe 未做代码签名，Windows 可能提示「已保护你的电脑」，
+  - 两个 exe 都没做代码签名，Windows 可能提示「已保护你的电脑」，
     点「更多信息 → 仍要运行」即可
 
 项目主页：https://github.com/longyu2/biliMusic

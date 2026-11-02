@@ -136,8 +136,16 @@
 
 <script>
   const q = new URLSearchParams(location.search);
-  document.getElementById('url').textContent = q.get('url') || '';
+  const targetUrl = q.get('url') || '';
+  document.getElementById('url').textContent = targetUrl;
   document.getElementById('detail').textContent = q.get('detail') || '';
+
+  // 连的是本机服务时，失败原因基本只有一个：biliMusic.exe 没启动
+  if (/localhost|127\.0\.0\.1/i.test(targetUrl)) {
+    document.querySelector('h1').textContent = '本机服务没有启动';
+    document.querySelector('.card p').innerHTML =
+      '先运行下载包里那个 <b>biliMusic.exe</b>，<br />等浏览器弹出页面后，再点下面的「重试」。';
+  }
 
   const retry = () => window.appBridge && window.appBridge.retry();
   document.getElementById('retry').addEventListener('click', retry);
