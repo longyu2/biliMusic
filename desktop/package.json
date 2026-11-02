@@ -31,6 +31,12 @@
       "mini/**/*",
       "package.json"
     ],
+    "extraFiles": [
+      {
+        "from": "config.default.json",
+        "to": "config.json"
+      }
+    ],
     "win": {
       "target": [
         {

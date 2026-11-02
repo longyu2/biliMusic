@@ -65,32 +65,83 @@ let tbCssKey = null;
 
 const userFile = (name) => path.join(app.getPath('userData'), name);
 
+// 程序所在目录：安装版是安装目录，绿色版就是解压出来的那个文件夹
+function appDir() {
+  return app.isPackaged ? path.dirname(app.getPath('exe')) : app.getAppPath();
+}
+
+/**
+ * 配置文件查找顺序：
+ *   1. 程序目录下的 config.json —— 就放在 exe 旁边，用户能直接找到、直接改
+ *   2. %APPDATA%\b站音乐播放器\config.json —— 老位置，兼容已经装过的
+ */
+function configCandidates() {
+  return [path.join(appDir(), 'config.json'), userFile('config.json')];
+}
+
+let configFile = null; // 实际生效的那个文件，连不上时会在错误页上显示路径
+
+function normalizeUrl(v) {
+  if (typeof v !== 'string') return '';
+  const s = v.trim();
+  if (!/^https?:\/\//i.test(s)) return '';
+  return s.endsWith('/') ? s : s + '/';
+}
+
+function writeTemplate(file) {
+  const body = {
+    _说明: '改 server 这一行就行。改完重启桌面端，或者点错误页上的「重试」。',
+    server: DEFAULT_URL,
+  };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(body, null, 2) + '\n', 'utf8');
+}
+
 function loadConfig() {
-  try {
-    const c = JSON.parse(fs.readFileSync(userFile('config.json'), 'utf8'));
-    if (c && typeof c.url === 'string' && /^https?:\/\//i.test(c.url.trim())) {
-      let url = c.url.trim();
-      // 老的默认地址（内网/外网）自动迁移到本机，用户不用手动改配置
-      if (LEGACY_URLS.includes(url)) {
-        url = DEFAULT_URL;
-        try {
-          fs.writeFileSync(userFile('config.json'), JSON.stringify({ url }, null, 2), 'utf8');
-        } catch {
-          /* 写不进去也不影响这次启动 */
-        }
-      }
-      targetUrl = url;
-    }
-  } catch {
+  for (const file of configCandidates()) {
+    let raw;
     try {
-      fs.mkdirSync(app.getPath('userData'), { recursive: true });
-      fs.writeFileSync(
-        userFile('config.json'),
-        JSON.stringify({ url: DEFAULT_URL }, null, 2),
-        'utf8'
-      );
+      raw = fs.readFileSync(file, 'utf8');
     } catch {
-      /* 写不了就用默认地址，不影响启动 */
+      continue; // 这个位置没有文件
+    }
+
+    let c;
+    try {
+      c = JSON.parse(raw);
+    } catch {
+      continue; // 文件在但不是合法 JSON，看下一个
+    }
+
+    // server 是新键名，url 是旧键名，两个都认
+    let url = normalizeUrl(c.server) || normalizeUrl(c.url);
+    if (!url) continue;
+
+    // 老的默认地址（内网/外网）自动迁到本机，用户不用手动改
+    if (LEGACY_URLS.includes(url)) {
+      url = DEFAULT_URL;
+      try {
+        const next = { ...c, server: url };
+        delete next.url;
+        fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', 'utf8');
+      } catch {
+        /* 写不进去也不影响这次启动 */
+      }
+    }
+
+    targetUrl = url;
+    configFile = file;
+    return;
+  }
+
+  // 一个可用的配置都没有：生成一份模板，优先放程序目录
+  for (const file of configCandidates()) {
+    try {
+      writeTemplate(file);
+      configFile = file;
+      break;
+    } catch {
+      /* 目录不可写，试下一个 */
     }
   }
 }
@@ -160,7 +211,7 @@ function showError(detail) {
   if (showingError) return; // did-fail-load 和 loadURL 的 reject 会同时来，只处理一次
   showingError = true;
   const file = path.join(__dirname, 'error', 'error.html');
-  const query = { url: targetUrl, detail: detail || '' };
+  const query = { url: targetUrl, detail: detail || '', config: configFile || '' };
   // 必须推迟一帧再导航：在 did-fail-load 里同步 loadFile 会让 Electron 崩溃
   setImmediate(() => {
     if (!win || win.isDestroyed()) return;
@@ -500,8 +551,21 @@ if (!app.requestSingleInstanceLock()) {
     createWindow();
   });
 
-  ipcMain.on('app:retry', openApp);
+  // 重试前先重读配置：改完 config.json 点一下重试就能生效，不用重启
+  ipcMain.on('app:retry', () => {
+    loadConfig();
+    openApp();
+  });
   ipcMain.on('app:quit', () => app.quit());
+
+  // 错误页上「打开配置文件」：在资源管理器里选中它，方便直接改
+  ipcMain.on('app:open-config', () => {
+    if (configFile && fs.existsSync(configFile)) {
+      shell.showItemInFolder(configFile);
+    } else {
+      shell.openPath(appDir());
+    }
+  });
 
   ipcMain.on('mini:open', openMini);
   ipcMain.on('mini:close', closeMini);

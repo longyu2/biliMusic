@@ -127,8 +127,10 @@
     <p>请确认这台电脑和服务器在同一个内网，<br />并且服务器上的播放器正在运行。</p>
     <div class="url" id="url">—</div>
     <div class="detail" id="detail"></div>
+    <div class="url" id="config" style="display:none; word-break:break-all; margin-top:6px"></div>
     <div class="btns">
       <button class="primary" id="retry">重试</button>
+      <button id="openCfg" style="display:none">打开配置文件</button>
       <button id="quit">退出</button>
     </div>
     <div class="hint" id="hint">6 秒后自动重试</div>
@@ -140,6 +142,15 @@
   document.getElementById('url').textContent = targetUrl;
   document.getElementById('detail').textContent = q.get('detail') || '';
 
+  // 把配置文件路径也显示出来，省得用户到处找
+  const cfg = q.get('config') || '';
+  if (cfg) {
+    const el = document.getElementById('config');
+    el.textContent = '配置文件：' + cfg;
+    el.style.display = '';
+    document.getElementById('openCfg').style.display = '';
+  }
+
   // 连的是本机服务时，失败原因基本只有一个：biliMusic.exe 没启动
   if (/localhost|127\.0\.0\.1/i.test(targetUrl)) {
     document.querySelector('h1').textContent = '本机服务没有启动';
@@ -149,6 +160,9 @@
 
   const retry = () => window.appBridge && window.appBridge.retry();
   document.getElementById('retry').addEventListener('click', retry);
+  document.getElementById('openCfg').addEventListener('click', () => {
+    window.appBridge && window.appBridge.openConfig();
+  });
   document.getElementById('quit').addEventListener('click', () => {
     window.appBridge && window.appBridge.quit();
   });

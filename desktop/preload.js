@@ -1,8 +1,9 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-// 错误页用：重试连接、退出应用
+// 错误页用：重试连接、打开配置文件、退出应用
 contextBridge.exposeInMainWorld('appBridge', {
   retry: () => ipcRenderer.send('app:retry'),
+  openConfig: () => ipcRenderer.send('app:open-config'),
   quit: () => ipcRenderer.send('app:quit'),
 });
 
