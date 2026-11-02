@@ -3,16 +3,9 @@ const path = require('path');
 const fs = require('fs');
 
 const APP_TITLE = 'b站音乐播放器';
-// 默认连本机服务（和单文件版 biliMusic.exe 配套使用）
+// 默认连本机服务（和单文件版 biliMusic.exe 配套使用）。
+// 注意：这只是“文件不存在时”生成的模板默认值，绝不用来覆盖用户已写好的 config.json。
 const DEFAULT_URL = 'http://localhost:7788/';
-// 早期版本默认连内网服务器。老用户升级后 config.json 里还留着旧地址，
-// 光改默认值没用，得在读取时把它们自动迁过来。
-const LEGACY_URLS = [
-  'http://192.168.1.3:7788/',
-  'http://192.168.1.3:7788',
-  'https://music.misaka-mikoto.cn:10000/',
-  'https://music.misaka-mikoto.cn:10000',
-];
 
 /* ---------------- 启动耗时打点 ---------------- */
 // 设 APP_TIMING=<文件路径> 就会把各阶段时间写进去，平时零开销
@@ -113,29 +106,18 @@ function loadConfig() {
       continue; // 文件在但不是合法 JSON，看下一个
     }
 
-    // server 是新键名，url 是旧键名，两个都认
+    // server 是新键名，url 是旧键名，两个都认，原样使用，绝不回写覆盖用户文件
     let url = normalizeUrl(c.server) || normalizeUrl(c.url);
     if (!url) continue;
-
-    // 老的默认地址（内网/外网）自动迁到本机，用户不用手动改
-    if (LEGACY_URLS.includes(url)) {
-      url = DEFAULT_URL;
-      try {
-        const next = { ...c, server: url };
-        delete next.url;
-        fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', 'utf8');
-      } catch {
-        /* 写不进去也不影响这次启动 */
-      }
-    }
 
     targetUrl = url;
     configFile = file;
     return;
   }
 
-  // 一个可用的配置都没有：生成一份模板，优先放程序目录
+  // 一个配置文件都没有：在程序目录生成一份模板（已有文件一律不覆盖）
   for (const file of configCandidates()) {
+    if (fs.existsSync(file)) continue; // 哪怕内容暂时读不动，也绝不碰用户的文件
     try {
       writeTemplate(file);
       configFile = file;
