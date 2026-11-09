@@ -22,11 +22,12 @@ function mark(name) {
 }
 mark('js-start');
 
-// 标题栏：和页面主题同色，窗口按钮由系统画在右上角
+// 标题栏：跟着页面主题走（页面里 --bg / --text-faint 由 style.css 按主题给值）
 const TB_HEIGHT = 36;
-const TB_COLOR = '#0d0a10';
+const TB_COLOR = '#0d0a10'; // 只在拿不到 CSS 变量时兜底（深色）
+const TB_LIGHT_COLOR = '#f4f5f7';
 const TB_CSS = `
-  html, body { background: ${TB_COLOR} !important; }
+  html, body { background: var(--bg, ${TB_COLOR}) !important; }
   body { padding-top: ${TB_HEIGHT}px !important; box-sizing: border-box !important; }
   .app { height: calc(100dvh - ${TB_HEIGHT}px) !important; }
   .gate, .modal, .np-view { top: ${TB_HEIGHT}px !important; }
@@ -40,14 +41,32 @@ const TB_CSS = `
     padding-left: 15px;
     font-size: 12px;
     letter-spacing: 0.4px;
-    color: rgba(255, 255, 255, 0.36);
+    color: var(--text-faint, rgba(255, 255, 255, 0.36));
     font-family: "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
-    background: ${TB_COLOR};
+    background: var(--bg, ${TB_COLOR});
     -webkit-app-region: drag;
     z-index: 2147483000;
     pointer-events: auto;
   }
 `;
+
+/**
+ * 原生标题栏（右上角那三个窗口按钮所在的条）由系统画，颜色只能从主进程改。
+ * 页面切换主题时会通过 preload 的 reportTheme 通知这里。
+ */
+function applyTitleBarTheme(theme) {
+  if (!win || win.isDestroyed()) return;
+  const light = theme === 'light';
+  try {
+    win.setTitleBarOverlay({
+      color: light ? TB_LIGHT_COLOR : TB_COLOR,
+      symbolColor: light ? '#3a3f48' : '#e9e9ef',
+      height: TB_HEIGHT,
+    });
+  } catch {
+    /* 老版本 Electron / 非 Windows 不支持，忽略即可 */
+  }
+}
 
 let win = null;
 let targetUrl = DEFAULT_URL;
@@ -218,11 +237,32 @@ function openApp() {
 
 const MINI_W = 372;
 const MINI_H = 108;
+// 拖出屏幕后收成的小球尺寸；窗口里留 5px 给阴影
+const BALL_W = 68;
+const BALL_H = 68;
+// 封面在完整卡片窗口里的中心点，收起/展开时以它为中心缩放，封面在屏幕上几乎不动
+const MINI_ART_CX = 50;
+const MINI_ART_CY = 53;
+const MINI_MORPH_MS = 280;
 
 let mini = null;
 let miniState = null;
+let miniCollapsed = false; // 已收起成小球
+let miniExpanded = null; // 收起前的卡片位置（已夹回屏幕内）
+let miniAdjusting = false; // 程序自己 setBounds 时忽略 moved
+let miniAnim = null; // 收起/展开的窗口尺寸动画
+let miniDragFrom = null; // 小球自定义拖动的起始 bounds
 
 const miniPosFile = () => userFile('mini-pos.json');
+
+function clampToWorkArea(b, wa) {
+  return {
+    x: Math.round(Math.min(Math.max(b.x, wa.x + 8), wa.x + wa.width - b.width - 8)),
+    y: Math.round(Math.min(Math.max(b.y, wa.y + 8), wa.y + wa.height - b.height - 8)),
+    width: b.width,
+    height: b.height,
+  };
+}
 
 function loadMiniPos() {
   const fallback = () => {
@@ -251,15 +291,126 @@ function loadMiniPos() {
 function saveMiniPos() {
   if (!mini || mini.isDestroyed()) return;
   try {
-    const b = mini.getBounds();
+    // 收起时存卡片位置，别让小球位置覆盖掉原来放卡片的地方
+    const b = miniCollapsed && miniExpanded ? miniExpanded : mini.getBounds();
     fs.writeFileSync(miniPosFile(), JSON.stringify({ x: b.x, y: b.y }), 'utf8');
   } catch {
     /* 记不住就算了 */
   }
 }
 
+function sendMiniMode() {
+  if (mini && !mini.isDestroyed()) mini.webContents.send('mini:mode', miniCollapsed ? 'ball' : 'card');
+}
+
+/** 窗口 bounds 缓动到目标值，和 CSS 里 280ms 的变形过渡同步 */
+function animateMiniBounds(to) {
+  if (!mini || mini.isDestroyed()) return;
+  if (miniAnim) {
+    clearInterval(miniAnim);
+    miniAnim = null;
+  }
+  const from = mini.getBounds();
+  if (from.x === to.x && from.y === to.y && from.width === to.width && from.height === to.height) return;
+
+  const startedAt = Date.now();
+  miniAdjusting = true;
+  miniAnim = setInterval(() => {
+    if (!mini || mini.isDestroyed()) {
+      clearInterval(miniAnim);
+      miniAnim = null;
+      miniAdjusting = false;
+      return;
+    }
+    const t = Math.min(1, (Date.now() - startedAt) / MINI_MORPH_MS);
+    const k = 1 - Math.pow(1 - t, 3); // ease-out
+    mini.setBounds({
+      x: Math.round(from.x + (to.x - from.x) * k),
+      y: Math.round(from.y + (to.y - from.y) * k),
+      width: Math.round(from.width + (to.width - from.width) * k),
+      height: Math.round(from.height + (to.height - from.height) * k),
+    });
+    if (t >= 1) {
+      clearInterval(miniAnim);
+      miniAnim = null;
+      miniAdjusting = false;
+      saveMiniPos();
+    }
+  }, 16);
+}
+
+/** 窗口有 1/3 以上在屏幕外时收起成小球，缩到最近的可视位置；force 用于左箭头手动收起 */
+function maybeCollapseMini(force) {
+  if (!mini || mini.isDestroyed() || miniCollapsed) return;
+  const b = mini.getBounds();
+  const wa = screen.getDisplayMatching(b).workArea;
+  if (!force) {
+    const ix = Math.max(0, Math.min(b.x + b.width, wa.x + wa.width) - Math.max(b.x, wa.x));
+    const iy = Math.max(0, Math.min(b.y + b.height, wa.y + wa.height) - Math.max(b.y, wa.y));
+    if (ix * iy > b.width * b.height * (2 / 3)) return;
+  }
+
+  miniExpanded = clampToWorkArea({ ...b, width: MINI_W, height: MINI_H }, wa);
+  miniCollapsed = true;
+  // 以封面中心为锚点，球停在封面原来的位置附近
+  const ball = clampToWorkArea(
+    { x: b.x + MINI_ART_CX - BALL_W / 2, y: b.y + MINI_ART_CY - BALL_H / 2, width: BALL_W, height: BALL_H },
+    wa
+  );
+  sendMiniMode();
+  animateMiniBounds(ball);
+}
+
+/** 点击小球恢复成完整卡片 */
+function restoreMiniCard() {
+  if (!mini || mini.isDestroyed() || !miniCollapsed) return;
+  const cb = mini.getBounds();
+  const wa = screen.getDisplayMatching(cb).workArea;
+  const target = clampToWorkArea(
+    {
+      x: cb.x + BALL_W / 2 - MINI_ART_CX,
+      y: cb.y + BALL_H / 2 - MINI_ART_CY,
+      width: MINI_W,
+      height: MINI_H,
+    },
+    wa
+  );
+
+  miniCollapsed = false;
+  miniExpanded = target;
+  sendMiniMode();
+  animateMiniBounds(target);
+}
+
+function onMiniMoved() {
+  if (!mini || mini.isDestroyed() || miniAdjusting) return;
+  const b = mini.getBounds();
+  if (miniCollapsed) {
+    // 球被拖到别处：记下它周围的大窗口位置，展开和下次启动都落在这附近
+    const wa = screen.getDisplayMatching(b).workArea;
+    miniExpanded = clampToWorkArea(
+      {
+        x: b.x + BALL_W / 2 - MINI_ART_CX,
+        y: b.y + BALL_H / 2 - MINI_ART_CY,
+        width: MINI_W,
+        height: MINI_H,
+      },
+      wa
+    );
+    saveMiniPos();
+    return;
+  }
+  saveMiniPos();
+  maybeCollapseMini();
+}
+
 function createMini() {
   const pos = loadMiniPos();
+  miniCollapsed = false;
+  miniExpanded = null;
+  miniAdjusting = false;
+  miniAnim = null;
+  miniDragFrom = null;
   mini = new BrowserWindow({
     width: MINI_W,
     height: MINI_H,
@@ -294,6 +445,7 @@ function createMini() {
   mini.webContents.on('did-finish-load', () => {
     if (process.env.APP_DEBUG) console.log('[mini] loaded, state=', !!miniState);
     if (miniState) mini.webContents.send('player:state', miniState);
+    sendMiniMode();
   });
   mini.webContents.on('did-fail-load', (_e, code, desc, url) => {
     console.log('[mini] load failed', code, desc, url);
@@ -302,20 +454,58 @@ function createMini() {
     console.log('[mini] renderer gone:', d && d.reason);
   });
 
-  mini.on('moved', saveMiniPos);
+  // 悬浮卡片右键菜单：放大 / 缩小
+  //   小球态「放大」= 展开成卡片
+  //   卡片态「放大」= 取消悬浮，回到主窗口
+  //   小球态「缩小」= 已经是球了，置灰
+  mini.webContents.on('context-menu', () => {
+    if (!mini || mini.isDestroyed()) return;
+    if (process.env.APP_DEBUG) console.log('[mini] context menu (main)');
+    const template = [
+      {
+        label: '放大',
+        click: () => {
+          if (miniCollapsed) restoreMiniCard();
+          else closeMini(); // 卡片态放大 = 取消悬浮，回主窗口
+        },
+      },
+      { label: '缩小', enabled: !miniCollapsed, click: () => maybeCollapseMini(true) },
+    ];
+    Menu.buildFromTemplate(template).popup({ window: mini });
+  });
+
+  mini.on('moved', onMiniMoved);
   mini.on('closed', () => {
+    if (miniAnim) {
+      clearInterval(miniAnim);
+      miniAnim = null;
+    }
     mini = null;
+    miniCollapsed = false;
+    miniExpanded = null;
+    miniAdjusting = false;
+    miniDragFrom = null;
   });
 }
 
 function openMini() {
   if (process.env.APP_DEBUG) console.log('[mini] open, existing=', !!mini);
   if (!mini || mini.isDestroyed()) createMini();
+  if (miniCollapsed) restoreMiniCard(); // 从主窗口再打开时总是完整卡片
   if (miniState && mini && !mini.isDestroyed()) mini.webContents.send('player:state', miniState);
   // showInactive：不抢焦点，用户可能正在别的窗口打字
   if (mini && !mini.isDestroyed()) mini.showInactive();
   if (win && !win.isDestroyed()) win.hide();
   if (process.env.APP_DEBUG && mini) console.log('[mini] bounds=', JSON.stringify(mini.getBounds()), 'visible=', mini.isVisible());
+}
+
+/** 直接从主窗口打开成小球形态（主页面右键「缩小为悬浮球」） */
+function openMiniBall() {
+  if (!mini || mini.isDestroyed()) createMini();
+  if (miniState && mini && !mini.isDestroyed()) mini.webContents.send('player:state', miniState);
+  if (mini && !mini.isDestroyed()) mini.showInactive();
+  if (win && !win.isDestroyed()) win.hide();
+  if (mini && !mini.isDestroyed() && !miniCollapsed) maybeCollapseMini(true);
 }
 
 function closeMini() {
@@ -550,7 +740,64 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   ipcMain.on('mini:open', openMini);
+  ipcMain.on('mini:open-ball', openMiniBall);
   ipcMain.on('mini:close', closeMini);
+  ipcMain.on('mini:card', restoreMiniCard);
+  ipcMain.on('mini:collapse', () => maybeCollapseMini(true));
+
+  // 页面切主题 → 原生标题栏跟着换色
+  ipcMain.on('ui:theme', (_e, theme) => applyTitleBarTheme(theme));
+
+  // 小球拖动：渲染进程上报屏幕位移，不用原生拖拽区（会吞掉鼠标点击）
+  ipcMain.on('mini:dragstart', () => {
+    if (!mini || mini.isDestroyed()) return;
+    miniDragFrom = mini.getBounds();
+    miniAdjusting = true;
+  });
+  ipcMain.on('mini:dragmove', (_e, d) => {
+    if (!mini || mini.isDestroyed() || !miniDragFrom || !d) return;
+    const wa = screen.getDisplayMatching(miniDragFrom).workArea;
+    const x = Math.round(miniDragFrom.x + (Number(d.dx) || 0));
+    const y = Math.round(miniDragFrom.y + (Number(d.dy) || 0));
+    if (miniCollapsed) {
+      // 小球始终留在屏幕内；卡片要允许拖出屏幕，才能触发自动收起
+      const b = clampToWorkArea({ x, y, width: BALL_W, height: BALL_H }, wa);
+      mini.setPosition(b.x, b.y);
+    } else {
+      mini.setPosition(x, y);
+    }
+  });
+  ipcMain.on('mini:dragend', (_e, moved) => {
+    miniDragFrom = null;
+    if (!mini || mini.isDestroyed()) {
+      miniAdjusting = false;
+      return;
+    }
+    miniAdjusting = false;
+    if (miniCollapsed) {
+      const b = mini.getBounds();
+      const wa = screen.getDisplayMatching(b).workArea;
+      miniExpanded = clampToWorkArea(
+        {
+          x: b.x + BALL_W / 2 - MINI_ART_CX,
+          y: b.y + BALL_H / 2 - MINI_ART_CY,
+          width: MINI_W,
+          height: MINI_H,
+        },
+        wa
+      );
+      saveMiniPos();
+      return;
+    }
+    if (moved) {
+      saveMiniPos();
+      maybeCollapseMini();
+    }
+  });
+
+  // （历史遗留）渲染进程旧版走 IPC 请求菜单；现在菜单统一由 context-menu 事件弹，
+  // 这里留空实现防止 unknown channel 报错
+  ipcMain.on('mini:menu', () => {});
 
   // 主窗口上报播放状态 → 转发给小卡片
   ipcMain.on('player:state', (_e, s) => {

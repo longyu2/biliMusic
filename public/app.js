@@ -11,6 +11,8 @@ const LS = {
   volume: 'bfp.volume',
   mode: 'bfp.mode',
   lastBvid: 'bfp.lastBvid',
+  user: 'bfp.user', // 只缓存昵称/头像/uid，真正的登录凭证在服务端 data/auth.json
+  view: 'bfp.view', // list | card
 };
 
 /* ---------------- 状态 ---------------- */
@@ -18,17 +20,29 @@ const state = {
   folders: [], // [{ mediaId, title, count, cover, upper }]
   mediaId: null,
   info: null,
-  tracks: [], // 全量曲目
+  tracks: [], // 全量曲目（当前列表：收藏夹 或 搜索结果）
   view: [], // 当前显示/播放顺序（tracks 的下标数组）
-  playingIndex: -1, // 在 tracks 里的下标
+  playingIndex: -1, // 在 tracks 里的下标（只用于高亮，列表切换后可能是 -1）
+  playingTrack: null, // 正在播放的那首（对象本身，和列表解耦：切到搜索结果也不丢）
   mode: 'list', // list | one | shuffle
   volume: 0.8,
   muted: false,
   query: '',
+  // 列表来源：folder = 收藏夹；search = B 站搜索结果（临时视图，不落盘）
+  listMode: 'folder',
+  viewMode: 'list', // list | card（卡片视图分页显示）
+  cardPage: 0, // 卡片视图当前页（0 起）
+  search: null, // { keyword, page, total, pages, tracks }
+  folderSnapshot: null, // 进搜索前的收藏夹现场，返回时原样还原
+  user: null, // 已登录的 B 站账号 { mid, uname, face }，没登录为 null
   // 乱序播放：一次性把列表打乱，然后按这个顺序依次播完，播完一轮再重新洗牌。
   // 不是「每首独立随机抽」—— 那样上一首根本回不去，也保证不了一轮内不重复。
   shuffleQueue: [], // 打乱后的 tracks 下标
   shufflePos: -1, // 当前播到队列的第几个
+  // 手动播放列表：右键「下一曲播放 / 添加到播放列表」入队。
+  // 存 track 对象本身（浅拷贝），与当前列表解耦——切收藏夹/搜索都不丢。
+  // queue[0] 固定是正在播的那首；播完一首 shift 掉，下一首顶上来。
+  queue: [],
   loading: false,
 };
 
@@ -54,6 +68,8 @@ function pushMiniState(force) {
     playing: !audio.paused && !audio.ended,
     pos: audio.currentTime || 0,
     dur: totalDuration() || 0,
+    volume: state.volume,
+    muted: state.muted,
   });
 }
 
@@ -158,13 +174,36 @@ function parseUid(text) {
   return m ? m[1] : null;
 }
 
+/** 合集链接：space.bilibili.com/<mid>/lists/<season_id>?type=season */
+function parseSeason(text) {
+  const s = String(text || '').trim();
+  if (!s) return null;
+  // /lists/ 同时用在合集和系列上，系列走 type=series，别误当成合集
+  if (/[?&]type=series\b/i.test(s)) return null;
+  const m = s.match(/space\.bilibili\.com\/(\d+)\/lists\/(\d+)/i);
+  if (m) return { mid: m[1], seasonId: m[2] };
+  const m2 = s.match(/^(\d+):(\d+)$/);
+  if (m2) return { mid: m2[1], seasonId: m2[2] };
+  return null;
+}
+
+/** 合集在收藏夹列表里的唯一键，和普通收藏夹的纯数字 mediaId 区分开 */
+function seasonKey(season) {
+  return `season:${season.mid}:${season.seasonId}`;
+}
+
+function parseSeasonKey(key) {
+  const m = String(key || '').match(/^season:(\d+):(\d+)$/);
+  return m ? { mid: m[1], seasonId: m[2] } : null;
+}
+
 /* ---------------- 收藏夹列表渲染 ---------------- */
 function renderFolders() {
   const box = $('#folderList');
   box.innerHTML = '';
 
   if (!state.folders.length) {
-    box.innerHTML = '<div class="f-count" style="padding:10px 9px;line-height:1.7">还没有收藏夹<br>点右上角 + 添加</div>';
+    box.innerHTML = '<div class="f-count" style="padding:10px 9px;line-height:1.7">还没有收藏夹 / 合集<br>点右上角 + 添加</div>';
     return;
   }
 
@@ -173,10 +212,11 @@ function renderFolders() {
     const el = document.createElement('div');
     el.className = 'folder' + (String(f.mediaId) === String(state.mediaId) ? ' active' : '');
     el.dataset.id = f.mediaId;
+    const seasonTag = parseSeasonKey(f.mediaId) ? '<span class="f-tag">合集</span>' : '';
     el.innerHTML = `
       <div class="f-cover"${f.cover ? ` style="background-image:url('${imgUrl(f.cover, '@80w_80h_1c')}')"` : ''}></div>
       <div class="f-body">
-        <div class="f-name" title="${escapeAttr(f.title)}">${escapeHtml(f.title)}</div>
+        <div class="f-name" title="${escapeAttr(f.title)}">${seasonTag}${escapeHtml(f.title)}</div>
         <div class="f-count">${f.count || 0} 首</div>
       </div>
       <button class="f-del" title="移除">
@@ -200,7 +240,7 @@ function renderFolders() {
         pressTimer = setTimeout(() => {
           pressTimer = null;
           longPressed = true;
-          if (confirm(`移除收藏夹「${f.title}」？\n只从本地列表移除，不影响 B 站收藏夹。`)) {
+          if (confirm(`移除「${f.title}」？\n只从本地列表移除，不影响 B 站收藏夹 / 合集。`)) {
             removeFolder(f.mediaId);
           }
         }, 650);
@@ -223,6 +263,12 @@ function renderFolders() {
       }
       if (String(f.mediaId) !== String(state.mediaId)) loadFolder(f.mediaId);
     });
+
+    // 右键合集/收藏夹条目：追加或替换播放列表
+    el.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      showFolderContextMenu(e.clientX, e.clientY, f);
+    });
     frag.appendChild(el);
   }
   box.appendChild(frag);
@@ -240,7 +286,7 @@ function removeFolder(mediaId) {
       state.tracks = [];
       state.view = [];
       renderFolders();
-      renderTracks();
+      renderCurrent();
       $('#gate').hidden = false;
       $('#app').hidden = true;
     }
@@ -270,6 +316,7 @@ function cacheAgo(iso) {
 
 async function loadFolder(mediaId, opts = {}) {
   if (state.loading) return;
+  leaveSearch(); // 从搜索结果点回某个收藏夹：直接丢掉搜索视图
   state.loading = true;
   state.mediaId = String(mediaId);
   persist(); // 记住当前选的是哪个收藏夹（存服务端，换设备也一致）
@@ -282,8 +329,12 @@ async function loadFolder(mediaId, opts = {}) {
   $('#favSub').textContent = opts.force ? '正在从 B 站重新读取' : '正在读取本地缓存';
 
   try {
-    // 默认读服务端缓存（data/fav/<id>.json），只有刷新按钮才回源
-    const q = `/api/fav?media_id=${encodeURIComponent(mediaId)}` + (opts.force ? '&refresh=1' : '');
+    // 默认读服务端缓存（data/fav/ 或 data/season/），只有刷新按钮才回源
+    const season = parseSeasonKey(mediaId);
+    const suffix = opts.force ? '&refresh=1' : '';
+    const q = season
+      ? `/api/season?mid=${encodeURIComponent(season.mid)}&season_id=${encodeURIComponent(season.seasonId)}${suffix}`
+      : `/api/fav?media_id=${encodeURIComponent(mediaId)}${suffix}`;
     const data = await api(q);
     if (!data.ok) throw new Error(data.error || '加载失败');
 
@@ -339,14 +390,34 @@ async function loadFolder(mediaId, opts = {}) {
 }
 
 function showSkeleton() {
-  const box = $('#trackList');
   $('#emptyState').hidden = true;
+
+  // 卡片视图：骨架画在网格里
+  if (state.viewMode === 'card') {
+    const grid = $('#cardGrid');
+    $('#trackList').hidden = true;
+    $('#cardPane').hidden = false;
+    let cards = '';
+    for (let i = 0; i < 8; i++) {
+      cards += `<div class="card sk-card">
+        <div class="sk" style="aspect-ratio:16/10;border-radius:8px"></div>
+        <div class="sk" style="height:11px;margin-top:9px;width:${70 + ((i * 7) % 25)}%"></div>
+        <div class="sk" style="height:10px;margin-top:6px;width:45%"></div>
+      </div>`;
+    }
+    grid.innerHTML = cards;
+    $('#cardPager').innerHTML = '';
+    return;
+  }
+
+  const box = $('#trackList');
   let html = '';
   for (let i = 0; i < 8; i++) {
     html += `<div class="skeleton-row">
       <div class="sk" style="width:14px;justify-self:center"></div>
       <div class="sk" style="width:${40 + ((i * 13) % 45)}%"></div>
       <div class="sk" style="width:60%"></div>
+      <div class="sk" style="width:70%;justify-self:end"></div>
       <div class="sk" style="width:70%;justify-self:end"></div>
     </div>`;
   }
@@ -355,7 +426,8 @@ function showSkeleton() {
 
 /* ---------------- 曲目列表渲染 ---------------- */
 function rebuildView() {
-  const q = state.query.trim().toLowerCase();
+  // 搜索结果整页给出来，不再叠一层本地过滤（搜「未闻花名」时结果标题里可能一个中文都没有）
+  const q = state.listMode === 'search' ? '' : state.query.trim().toLowerCase();
   state.view = [];
   state.tracks.forEach((t, i) => {
     if (!q || t.title.toLowerCase().includes(q) || (t.upper || '').toLowerCase().includes(q)) {
@@ -365,7 +437,233 @@ function rebuildView() {
   // 搜索过滤后列表变了，旧的乱序队列作废
   state.shuffleQueue = [];
   state.shufflePos = -1;
-  renderTracks();
+  state.cardPage = 0; // 列表变了，卡片视图回到第一页
+  renderCurrent();
+}
+
+/** 按当前视图（列表 / 卡片）渲染 */
+function renderCurrent() {
+  const cardMode = state.viewMode === 'card';
+  const cols = document.querySelector('.list-cols');
+  const list = $('#trackList');
+  const pane = $('#cardPane');
+  if (cols) cols.hidden = cardMode; // 卡片视图不需要「#/歌曲/UP/时长」表头
+  if (list) list.hidden = cardMode;
+  if (pane) pane.hidden = !cardMode;
+
+  if (!state.view.length) {
+    if (pane) pane.hidden = true;
+    renderTracks(); // 复用列表那套空状态文案
+    return;
+  }
+  $('#emptyState').hidden = true;
+  if (cardMode) renderCards();
+  else renderTracks();
+  // 自动给当前列表的所有曲目获取音质（含已缓存的，服务端秒回）
+  brSeen.clear();
+  queueBitrates(state.view.map((ti) => state.tracks[ti]).filter(Boolean));
+}
+
+/* ---------------- 音质 / 码率（自动获取全部，含已缓存） ---------------- */
+
+/** 192000 -> "192k"；1100 以上按 M 显示；estimated（durl 估算）加个 ≈ */
+function fmtBitrate(bw, estimated) {
+  if (!bw || bw <= 0) return '—';
+  const k = Math.round(bw / 1000);
+  const v = k >= 1000 ? `${(k / 1000).toFixed(1)}M` : `${k}k`;
+  return estimated ? `≈${v}` : v;
+}
+
+function brLabel(t) {
+  if (t.bandwidth) return fmtBitrate(t.bandwidth, t.estimated);
+  return t.bitrateChecked ? '—' : '…';
+}
+
+const brQueue = [];
+const brSeen = new Set(); // 本轮去重，防止同一 bvid 重复入队
+let brRunning = false;
+
+/** 入队查码率——不跳过已查过的，已缓存的在服务端秒回，代价很小 */
+function queueBitrates(tracks) {
+  let added = false;
+  for (const t of tracks) {
+    if (!t || !t.bvid) continue;
+    if (brSeen.has(t.bvid)) continue;
+    brSeen.add(t.bvid);
+    brQueue.push(t);
+    added = true;
+  }
+  if (added) pumpBitrates();
+}
+
+/** 一次问 8 条（服务端每条要两次请求），问完再画到对应的行/卡片上 */
+async function pumpBitrates() {
+  if (brRunning) return;
+  brRunning = true;
+  try {
+    while (brQueue.length) {
+      const batch = brQueue.splice(0, 8);
+      const bvids = batch.map((t) => t.bvid);
+      try {
+        const j = await api(`/api/bitrates?bvids=${encodeURIComponent(bvids.join(','))}`);
+        if (j && j.ok) {
+          for (const t of batch) {
+            const b = j.map[t.bvid];
+            t.bitrateChecked = true;
+            bvRateApplied(t, b);
+          }
+        }
+      } catch {
+        /* 查不到就先留着「…」，下次重画再试 */
+      }
+      if (brQueue.length) await new Promise((r) => setTimeout(r, 120));
+    }
+  } finally {
+    brRunning = false;
+  }
+}
+
+function bvRateApplied(t, b) {
+  if (b && b.bandwidth) {
+    t.bandwidth = b.bandwidth;
+    t.quality = b.quality || 0;
+    t.estimated = !!b.estimated;
+  }
+  const txt = brLabel(t);
+  document.querySelectorAll(`[data-bvid="${t.bvid}"] .t-br`).forEach((el) => {
+    el.textContent = txt;
+    el.classList.toggle('known', !!t.bandwidth);
+  });
+  // 卡片上只在拿到码率后才显示这个角标
+  document.querySelectorAll(`[data-bvid="${t.bvid}"] .c-br`).forEach((el) => {
+    el.textContent = t.bandwidth ? fmtBitrate(t.bandwidth, t.estimated) : '';
+    el.hidden = !t.bandwidth;
+  });
+}
+
+/* ---------------- 卡片视图（分页） ---------------- */
+const CARD_PAGE_SIZE = 24;
+
+function cardPageCount() {
+  return Math.max(1, Math.ceil(state.view.length / CARD_PAGE_SIZE));
+}
+
+function renderCards() {
+  const grid = $('#cardGrid');
+  if (!grid) return;
+
+  const total = cardPageCount();
+  if (state.cardPage >= total) state.cardPage = total - 1;
+  if (state.cardPage < 0) state.cardPage = 0;
+
+  const start = state.cardPage * CARD_PAGE_SIZE;
+  const pageItems = state.view.slice(start, start + CARD_PAGE_SIZE);
+
+  const frag = document.createDocumentFragment();
+  for (const ti of pageItems) {
+    const t = state.tracks[ti];
+    if (!t) continue;
+    const active = ti === state.playingIndex;
+    const el = document.createElement('div');
+    el.className = 'card' + (active ? ' active' : '') + (t.dead ? ' dead' : '');
+    el.dataset.idx = ti;
+    if (t.bvid) el.dataset.bvid = t.bvid;
+    el.title = t.upper ? `${t.title}\n${t.upper}` : t.title || '';
+    el.innerHTML = `
+      <div class="c-cover"${t.cover ? ` style="background-image:url('${imgUrl(t.cover, '@320w_200h_1c')}')"` : ''}>
+        ${active ? `<div class="bars${audio.paused ? ' paused' : ''}"><i></i><i></i><i></i></div>` : ''}
+        ${t.seasonTitle ? `<span class="c-season" title="来自合集：${escapeAttr(t.seasonTitle)}">合集</span>` : ''}
+        <span class="c-br"${t.bandwidth ? '' : ' hidden'}>${t.bandwidth ? fmtBitrate(t.bandwidth, t.estimated) : ''}</span>
+        ${t.duration ? `<span class="c-dur">${fmtTime(t.duration)}</span>` : ''}
+      </div>
+      <div class="c-title">${escapeHtml(t.title)}</div>
+      <div class="c-upper">${escapeHtml(t.upper || '')}</div>`;
+
+    if (!t.dead) el.addEventListener('click', () => playAt(ti));
+    if (t.bvid) {
+      el.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        showContextMenu(e.clientX, e.clientY, { bvid: t.bvid, track: t });
+      });
+    }
+    frag.appendChild(el);
+  }
+
+  grid.innerHTML = '';
+  grid.appendChild(frag);
+  renderPager(total);
+}
+
+function renderPager(total) {
+  const pager = $('#cardPager');
+  if (!pager) return;
+  pager.innerHTML = '';
+
+  const addBtn = (label, page, { on = false, disabled = false } = {}) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'pg-btn' + (on ? ' on' : '');
+    b.textContent = label;
+    if (disabled) b.disabled = true;
+    else if (!on) b.addEventListener('click', () => goCardPage(page));
+    pager.appendChild(b);
+  };
+  const addDots = () => {
+    const s = document.createElement('span');
+    s.className = 'pg-dots';
+    s.textContent = '…';
+    pager.appendChild(s);
+  };
+
+  if (total > 1) {
+    addBtn('‹', state.cardPage - 1, { disabled: state.cardPage === 0 });
+
+    // 首页、末页、当前页附近各留几个，中间用省略号
+    const pages = [];
+    for (let p = 0; p < total; p++) {
+      if (p === 0 || p === total - 1 || Math.abs(p - state.cardPage) <= 2) pages.push(p);
+    }
+    let prev = -2;
+    for (const p of pages) {
+      if (p - prev > 1) addDots();
+      addBtn(String(p + 1), p, { on: p === state.cardPage });
+      prev = p;
+    }
+
+    addBtn('›', state.cardPage + 1, { disabled: state.cardPage >= total - 1 });
+  }
+
+  const info = document.createElement('span');
+  info.className = 'pg-info';
+  info.textContent =
+    (total > 1 ? `第 ${state.cardPage + 1} / ${total} 页 · ` : '') + `共 ${state.view.length} 首`;
+  pager.appendChild(info);
+}
+
+function goCardPage(page) {
+  state.cardPage = Math.max(0, page);
+  renderCards();
+  const pane = $('.list-pane');
+  if (pane) pane.scrollTop = 0;
+}
+
+/** 切换列表 / 卡片视图，选择记在本机 */
+function setViewMode(mode, remember = true) {
+  state.viewMode = mode === 'card' ? 'card' : 'list';
+  const btn = $('#viewBtn');
+  if (btn) {
+    btn.classList.toggle('card', state.viewMode === 'card');
+    btn.title = state.viewMode === 'card' ? '切换到列表视图' : '切换到卡片视图';
+  }
+  state.cardPage = 0;
+  if (remember) {
+    try {
+      localStorage.setItem(LS.view, state.viewMode);
+    } catch {
+      /* 隐私模式忽略 */
+    }
+  }
+  renderCurrent();
 }
 
 function renderTracks() {
@@ -375,11 +673,20 @@ function renderTracks() {
   if (!state.view.length) {
     box.innerHTML = '';
     empty.hidden = false;
-    empty.textContent = state.query
-      ? `没有匹配「${state.query}」的曲目`
-      : state.tracks.length
-      ? '这个收藏夹是空的'
-      : '没有数据，试试右上角重新加载';
+    if (state.listMode === 'search') {
+      empty.textContent = `B 站没搜到「${(state.search && state.search.keyword) || ''}」的相关视频`;
+    } else if (state.query) {
+      // 本地没搜到：给一条去 B 站搜的出路
+      empty.innerHTML =
+        `没有匹配「${escapeHtml(state.query)}」的曲目` +
+        `<div class="empty-actions"><button id="emptySearchBtn" class="ghost-btn" type="button">在 B 站搜索「${escapeHtml(
+          state.query
+        )}」</button></div>`;
+      const go = $('#emptySearchBtn');
+      if (go) go.addEventListener('click', () => doSearch(state.query));
+    } else {
+      empty.textContent = state.tracks.length ? '这个收藏夹是空的' : '没有数据，试试右上角重新加载';
+    }
     return;
   }
   empty.hidden = true;
@@ -391,6 +698,7 @@ function renderTracks() {
     const el = document.createElement('div');
     el.className = 'track' + (active ? ' active' : '') + (t.dead ? ' dead' : '');
     el.dataset.idx = ti;
+    if (t.bvid) el.dataset.bvid = t.bvid;
 
     let idxHtml;
     if (active) {
@@ -399,21 +707,734 @@ function renderTracks() {
       idxHtml = String(pos + 1);
     }
 
+    const seasonTag = t.seasonTitle
+      ? `<span class="t-season" title="来自合集：${escapeAttr(t.seasonTitle)}">合集</span>`
+      : '';
+
     el.innerHTML = `
       <div class="t-idx">${idxHtml}</div>
       <div class="t-main">
         <div class="t-thumb"${t.cover ? ` style="background-image:url('${imgUrl(t.cover, '@80w_80h_1c')}')"` : ''}></div>
-        <div class="t-title" title="${escapeAttr(t.title)}">${escapeHtml(t.title)}</div>
+        <div class="t-title" title="${escapeAttr(t.title)}">${seasonTag}${escapeHtml(t.title)}</div>
       </div>
       <div class="t-upper" title="${escapeAttr(t.upper)}">${escapeHtml(t.upper)}</div>
+      <div class="t-br">${brLabel(t)}</div>
       <div class="t-time">${fmtTime(t.duration)}</div>`;
 
     if (!t.dead) el.addEventListener('click', () => playAt(ti));
+    // 右键先出菜单，点击菜单项再去 B 站看原视频 / 收藏到自己收藏夹
+    if (t.bvid) {
+      el.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        showContextMenu(e.clientX, e.clientY, { bvid: t.bvid, track: t });
+      });
+    }
     frag.appendChild(el);
   });
 
   box.innerHTML = '';
   box.appendChild(frag);
+}
+
+/* ---------------- B 站搜索 ---------------- */
+
+/** 当前列表对应的收藏夹 ID（搜索结果不属于任何收藏夹，进度/历史里记 null） */
+function listId() {
+  return state.listMode === 'search' ? null : state.mediaId;
+}
+
+function showSearchBar(text) {
+  const bar = $('#searchBar');
+  const label = $('#searchLabel');
+  if (bar) bar.hidden = false;
+  if (label) label.textContent = text || '';
+}
+
+function hideSearchBar() {
+  const bar = $('#searchBar');
+  if (bar) bar.hidden = true;
+}
+
+/** 搜索结果条的文案：关键词 / 第几页 / 条数 */
+function searchBarText() {
+  const s = state.search;
+  if (!s) return '';
+  const n = state.tracks.length;
+  return (
+    `B站搜索「${s.keyword}」· 第 ${s.page || 1} 页 · ${n} 首` +
+    (s.total ? `（共约 ${s.total} 个结果）` : '')
+  );
+}
+
+let searching = false;
+
+/**
+ * 在 B 站搜视频，只取第一页（20 条）。
+ * 结果临时替换列表：state.tracks 换成搜索结果，收藏夹现场存进 folderSnapshot，
+ * 「返回列表」时原样还原 —— 搜索不写 library.json，也不动用户的收藏夹。
+ */
+async function doSearch(rawKeyword) {
+  const kw = String(rawKeyword || '').trim();
+  if (!kw) {
+    toast('先输入要搜的内容', 1600);
+    return;
+  }
+  if (searching) return;
+  searching = true;
+
+  // 第一次进搜索时记下收藏夹现场
+  if (state.listMode !== 'search') {
+    state.folderSnapshot = {
+      mediaId: state.mediaId,
+      info: state.info,
+      tracks: state.tracks,
+      query: state.query,
+      title: $('#favTitle').textContent,
+      sub: $('#favSub').textContent,
+      cover: (state.info && state.info.cover) || '',
+    };
+  }
+
+  state.listMode = 'search';
+  state.search = { keyword: kw, page: 1, total: 0, pages: 0 };
+  $('#searchInput').value = kw;
+  $('#favTitle').textContent = `搜索：${kw}`;
+  $('#favSub').textContent = '正在从 B 站搜索…';
+  showSearchBar(`正在搜索「${kw}」…`);
+  showSkeleton();
+
+  try {
+    const data = await api(`/api/search?keyword=${encodeURIComponent(kw)}&page=1`);
+    if (!data.ok) throw new Error(data.error || '搜索失败');
+
+    state.search = data;
+    state.tracks = data.tracks || [];
+    state.query = ''; // 搜索结果整页给出，不做本地二次过滤
+    // 正在播的那首通常不在结果里，playingIndex 归 -1；播放本身不受影响
+    state.playingIndex = state.playingTrack
+      ? state.tracks.findIndex((t) => t.bvid === state.playingTrack.bvid)
+      : -1;
+    state.shuffleQueue = [];
+    state.shufflePos = -1;
+    rebuildView();
+
+    const n = state.tracks.length;
+    $('#favSub').textContent =
+      `B站搜索 · 第 1 页 · ${n} 首` + (data.total ? ` · 共约 ${data.total} 个结果` : '');
+    showSearchBar(searchBarText());
+    if (!n) toast(`B 站没搜到「${kw}」`, 2200);
+    enrichSearchSeasons(); // 后台补「这条属于哪个合集」，补完会自动重画一次
+  } catch (e) {
+    state.search = { keyword: kw, page: 1, total: 0, pages: 0 };
+    state.tracks = [];
+    state.playingIndex = -1;
+    rebuildView();
+    $('#favSub').textContent = '搜索失败';
+    showSearchBar(`搜索「${kw}」失败：${e.message}`);
+    toast('搜索失败：' + e.message, 3200);
+  } finally {
+    searching = false;
+  }
+}
+
+/**
+ * 搜索结果里哪些视频属于某个合集：B 站搜索接口不给这个信息，
+ * 后台逐条问一次（服务端带缓存 + 限速），回来后在列表/卡片上打「合集」标，
+ * 右键也就多出「导入整个合集」。
+ */
+let seasonEnrichToken = 0;
+
+async function enrichSearchSeasons() {
+  if (state.listMode !== 'search') return;
+  const token = ++seasonEnrichToken;
+  const keyword = (state.search && state.search.keyword) || '';
+  const bvids = state.tracks
+    .filter((t) => t.bvid && !t.seasonChecked)
+    .map((t) => t.bvid)
+    .slice(0, 20);
+  if (!bvids.length) return;
+
+  try {
+    const j = await api(`/api/seasons?bvids=${encodeURIComponent(bvids.join(','))}`);
+    if (!j.ok) return;
+    // 这期间又搜了别的 / 已经退出搜索：结果作废
+    if (token !== seasonEnrichToken) return;
+    if (state.listMode !== 'search' || ((state.search && state.search.keyword) || '') !== keyword) return;
+
+    let changed = false;
+    for (const t of state.tracks) {
+      if (!Object.prototype.hasOwnProperty.call(j.map, t.bvid)) continue;
+      const s = j.map[t.bvid];
+      t.seasonChecked = true;
+      if (s) {
+        t.seasonId = s.seasonId;
+        t.seasonMid = s.mid;
+        t.seasonTitle = s.title || '合集';
+        t.seasonCover = s.cover || '';
+        changed = true;
+      }
+    }
+    if (changed) renderCurrent();
+  } catch {
+    /* 补不上就算了，不影响播放 */
+  }
+}
+
+/** 右键「导入整个合集」：把这个视频所在的合集当歌单加进侧栏 */
+async function importSeasonOfTrack(t) {
+  if (!t || !t.seasonId || !t.seasonMid) return;
+  try {
+    await addSeason({ mid: String(t.seasonMid), seasonId: String(t.seasonId) }, { keepView: true });
+  } catch (e) {
+    toast('导入合集失败：' + e.message, 3200);
+  }
+}
+
+/** 退出搜索视图并还原收藏夹现场（纯内存还原，不重新请求网络） */
+function exitSearch() {
+  if (state.listMode !== 'search') return;
+  state.listMode = 'folder';
+  const snap = state.folderSnapshot;
+  state.folderSnapshot = null;
+  state.search = null;
+  hideSearchBar();
+
+  if (snap) {
+    state.mediaId = snap.mediaId;
+    state.info = snap.info;
+    state.tracks = snap.tracks || [];
+    state.query = snap.query || '';
+    $('#searchInput').value = state.query;
+    $('#favTitle').textContent = snap.title;
+    $('#favSub').textContent = snap.sub;
+    $('#favCover').style.backgroundImage = snap.cover ? `url('${imgUrl(snap.cover, '@120w_120h_1c')}')` : '';
+  } else {
+    state.tracks = [];
+    state.query = '';
+    $('#searchInput').value = '';
+  }
+
+  // 播放中的那首如果恰好在新列表里，接着高亮它；不在就只是不高亮
+  state.playingIndex = state.playingTrack
+    ? state.tracks.findIndex((t) => t.bvid === state.playingTrack.bvid)
+    : -1;
+  state.shuffleQueue = [];
+  state.shufflePos = -1;
+  rebuildView();
+  renderFolders();
+}
+
+/** 静默离开搜索：用户直接点了别的收藏夹，搜索现场就不要了 */
+function leaveSearch() {
+  if (state.listMode !== 'search') return;
+  state.listMode = 'folder';
+  state.folderSnapshot = null;
+  state.search = null;
+  state.query = '';
+  hideSearchBar();
+  const input = $('#searchInput');
+  if (input) input.value = '';
+}
+
+/* ---------------- 右键菜单（列表 / 播放页共用） ---------------- */
+let ctxTrack = null; // 右键点的是哪一首（收藏时要用到 avid 等字段）
+
+function hideContextMenu() {
+  const menu = $('#ctxMenu');
+  if (!menu || menu.hidden) return;
+  menu.hidden = true;
+  delete menu.dataset.bvid;
+}
+
+function showContextMenu(x, y, opts) {
+  const menu = $('#ctxMenu');
+  if (!menu) return;
+
+  const bvid = (opts && opts.bvid) || '';
+  const showMini = !!(opts && opts.mini && DESKTOP);
+  ctxTrack = (opts && opts.track) || null;
+  const showFav = !!(ctxTrack && ctxTrack.bvid);
+  // 「移动到收藏夹」只在「当前看的就是一个 B 站收藏夹」时才给：
+  // 搜索结果、合集、别的列表里的歌本来就不属于哪个收藏夹，谈不上移动
+  const showMove = showFav && !!currentFavFolderId();
+  // 「导入整个合集」：这首视频本身属于某个合集时才有
+  const showSeason = !!(ctxTrack && ctxTrack.seasonId && ctxTrack.seasonMid);
+  if (!bvid && !showMini && !showFav) return; // 没有可点的项，交给系统菜单
+
+  menu.dataset.bvid = bvid;
+  const biliItem = menu.querySelector('[data-action="open-bili"]');
+  const miniItem = menu.querySelector('[data-action="open-mini"]');
+  const favItem = menu.querySelector('[data-action="add-fav"]');
+  const moveItem = menu.querySelector('[data-action="move-fav"]');
+  const seasonItem = menu.querySelector('[data-action="import-season"]');
+  if (biliItem) biliItem.hidden = !bvid;
+  if (miniItem) miniItem.hidden = !showMini;
+  if (favItem) favItem.hidden = !showFav;
+  if (moveItem) moveItem.hidden = !showMove;
+  if (seasonItem) {
+    seasonItem.hidden = !showSeason;
+    if (showSeason) seasonItem.title = ctxTrack.seasonTitle || '';
+  }
+
+  menu.hidden = false;
+
+  // 先显示再量尺寸，避免菜单在窗口右下角被裁掉
+  const rect = menu.getBoundingClientRect();
+  const pad = 8;
+  const left = Math.max(pad, Math.min(x, window.innerWidth - rect.width - pad));
+  const top = Math.max(pad, Math.min(y, window.innerHeight - rect.height - pad));
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+}
+
+function initContextMenu() {
+  const menu = $('#ctxMenu');
+  if (!menu) return;
+
+  menu.addEventListener('click', (e) => {
+    const item = e.target.closest('.ctx-item');
+    if (!item || item.hidden) return;
+    const action = item.dataset.action;
+    const bvid = menu.dataset.bvid;
+    const track = ctxTrack;
+    hideContextMenu();
+
+    if (action === 'open-bili' && bvid) {
+      // 桌面端由主进程 setWindowOpenHandler 转给系统浏览器
+      window.open(`https://www.bilibili.com/video/${encodeURIComponent(bvid)}`, '_blank', 'noopener');
+    } else if (action === 'open-mini' && DESKTOP) {
+      DESKTOP.openMini();
+    } else if (action === 'add-fav') {
+      openFavPicker(track);
+    } else if (action === 'move-fav') {
+      openFavPicker(track, { mode: 'move', fromFolderId: currentFavFolderId() });
+    } else if (action === 'import-season') {
+      importSeasonOfTrack(track);
+    } else if (action === 'play-now' && track) {
+      // 立即播放：打断当前，切到这首；在当前列表里就按列表方式播（高亮一致），
+      // 不在列表里（搜索结果）就通过队列播
+      const idx = state.tracks.findIndex((x) => x.bvid === track.bvid);
+      if (idx >= 0 && !state.tracks[idx].dead) {
+        playAt(idx);
+      } else if (state.queue.length) {
+        state.queue.splice(0, 1, { ...track }); // 队首换成它，待播保留
+        queuePlayAt(0);
+      } else {
+        state.queue = [{ ...track }];
+        queuePlayAt(0);
+      }
+    } else if (action === 'play-next' && track) {
+      if (queueAdd(track, 1)) toast('已插到下一曲播放', 1600);
+      else toast('已经在播放列表里了', 1600);
+    } else if (action === 'add-queue' && track) {
+      if (queueAdd(track)) toast('已加入播放列表', 1600);
+      else toast('已经在播放列表里了', 1600);
+    }
+  });
+
+  // 播放页右键：网页端只有「在浏览器中打开」，桌面端多一个「悬浮窗」
+  npView.addEventListener('contextmenu', (e) => {
+    const t = currentTrack();
+    const bvid = t ? t.bvid : '';
+    if (!bvid && !DESKTOP) return; // 纯网页没有可选项，保留系统菜单
+    e.preventDefault();
+    showContextMenu(e.clientX, e.clientY, { bvid, mini: true, track: t });
+  });
+
+  document.addEventListener('mousedown', (e) => {
+    if (!menu.hidden && !menu.contains(e.target)) hideContextMenu();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !menu.hidden) hideContextMenu();
+  });
+  window.addEventListener('blur', hideContextMenu);
+  window.addEventListener('resize', hideContextMenu);
+  window.addEventListener('scroll', hideContextMenu, true);
+}
+
+initContextMenu();
+
+/* ---------------- 主页面空白处右键（桌面端）：缩小为悬浮窗 / 悬浮球 ---------------- */
+function initPageContextMenu() {
+  const menu = $('#pageCtxMenu');
+  if (!menu || !DESKTOP) return;
+
+  document.addEventListener('contextmenu', (e) => {
+    // 曲目行、卡片、播放页自己已经处理过（preventDefault），这里不重复弹
+    if (e.defaultPrevented) return;
+    if (e.target.closest('input, textarea, [contenteditable="true"]')) return;
+    if (e.target.closest('.ctx-menu, .queue-panel, .modal')) return;
+    e.preventDefault();
+    menu.hidden = false;
+    const rect = menu.getBoundingClientRect();
+    const pad = 8;
+    menu.style.left = `${Math.max(pad, Math.min(e.clientX, window.innerWidth - rect.width - pad))}px`;
+    menu.style.top = `${Math.max(pad, Math.min(e.clientY, window.innerHeight - rect.height - pad))}px`;
+  });
+
+  menu.addEventListener('click', (e) => {
+    const item = e.target.closest('.ctx-item');
+    if (!item) return;
+    const action = item.dataset.action;
+    menu.hidden = true;
+    if (action === 'mini-card') DESKTOP.openMini();
+    else if (action === 'mini-ball' && DESKTOP.openMiniBall) DESKTOP.openMiniBall();
+  });
+
+  document.addEventListener('mousedown', (e) => {
+    if (!menu.hidden && !menu.contains(e.target)) menu.hidden = true;
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') menu.hidden = true;
+  });
+  window.addEventListener('blur', () => { menu.hidden = true; });
+  window.addEventListener('scroll', () => { menu.hidden = true; }, true);
+}
+
+initPageContextMenu();
+
+/* ---------------- B 站登录（扫码） ---------------- */
+
+let qrKey = null;
+let qrTimer = null;
+
+/** 把昵称/头像记在本机：服务端一时连不上时，界面不至于突然显示「未登录」 */
+function rememberUser(u) {
+  try {
+    if (u && u.mid) localStorage.setItem(LS.user, JSON.stringify({ mid: u.mid, uname: u.uname, face: u.face }));
+    else localStorage.removeItem(LS.user);
+  } catch {
+    /* 隐私模式写不进去，无所谓 */
+  }
+}
+
+function cachedUser() {
+  try {
+    const u = JSON.parse(localStorage.getItem(LS.user) || 'null');
+    return u && u.mid ? u : null;
+  } catch {
+    return null;
+  }
+}
+
+function renderAccount() {
+  const btn = $('#acctBtn');
+  if (!btn) return;
+  const u = state.user;
+  btn.title = u ? `已登录：${u.uname}（点击查看 / 退出）` : '登录 B 站';
+  btn.classList.toggle('on', !!u);
+  if (u && u.face) {
+    btn.classList.add('has-avatar');
+    btn.style.backgroundImage = `url('${imgUrl(u.face, '@80w_80h_1c')}')`;
+  } else {
+    btn.classList.remove('has-avatar');
+    btn.style.backgroundImage = '';
+  }
+}
+
+function stopQrPolling() {
+  if (qrTimer) {
+    clearInterval(qrTimer);
+    qrTimer = null;
+  }
+}
+
+/** 把登录二维码画成 SVG（用 public/qr.js，纯本地生成，不经过任何第三方） */
+function qrSvg(text) {
+  const qr = qrcode(0, 'M');
+  qr.addData(text);
+  qr.make();
+  return qr.createSvgTag({ cellSize: 6, margin: 2, scalable: true });
+}
+
+function renderLoginState() {
+  const logged = !!state.user;
+  $('#qrBox').hidden = logged;
+  $('#qrStatus').hidden = logged;
+  $('#loginUser').hidden = !logged;
+  $('#loginRefresh').hidden = logged;
+  $('#loginLogout').hidden = !logged;
+
+  // 已登录时，这个弹窗就是「账号 + 导入页」
+  const imp = $('#acctImport');
+  if (imp) imp.hidden = !logged;
+  const impBtn = $('#acctImportBtn');
+  if (impBtn) impBtn.hidden = !logged;
+
+  if (logged) {
+    $('#loginName').textContent = state.user.uname || '已登录';
+    $('#loginAvatar').style.backgroundImage = state.user.face
+      ? `url('${imgUrl(state.user.face, '@120w_120h_1c')}')`
+      : '';
+  }
+}
+
+async function refreshQr() {
+  stopQrPolling();
+  const box = $('#qrBox');
+  box.innerHTML = '<div class="qr-loading">正在获取二维码…</div>';
+  $('#qrStatus').textContent = '请用 B 站手机客户端扫码';
+  try {
+    const j = await api('/api/login/qr');
+    if (!j.ok) throw new Error(j.error || '获取二维码失败');
+    qrKey = j.key;
+    box.innerHTML = qrSvg(j.url);
+    qrTimer = setInterval(pollQr, 2000);
+  } catch (e) {
+    qrKey = null;
+    box.innerHTML = `<div class="qr-loading">获取失败：${escapeHtml(e.message)}</div>`;
+    $('#qrStatus').textContent = '点「刷新二维码」重试';
+  }
+}
+
+async function pollQr() {
+  if (!qrKey) return;
+  let j;
+  try {
+    j = await api(`/api/login/poll?key=${encodeURIComponent(qrKey)}`);
+  } catch {
+    return; // 网络抖一下，下一轮继续
+  }
+  if (j.status === 'scanned') {
+    $('#qrStatus').textContent = '已扫码，请在手机上点确认';
+    return;
+  }
+  if (j.status === 'expired') {
+    stopQrPolling();
+    qrKey = null;
+    $('#qrStatus').textContent = '二维码已过期，点「刷新二维码」';
+    return;
+  }
+  if (j.status === 'success') {
+    stopQrPolling();
+    qrKey = null;
+    state.user = j.user;
+    rememberUser(state.user);
+    renderAccount();
+    renderLoginState();
+    toast(`已登录：${j.user.uname}`, 2200);
+    if (!$('#favPickModal').hidden) loadFavFolders();
+    if (!$('#modal').hidden && modalTab === 'mine') loadMineFolders();
+    if (!$('#loginModal').hidden) loadAcctFolders();
+    setTimeout(() => {
+      if (!$('#loginModal').hidden) closeLogin();
+    }, 900);
+    return;
+  }
+  if (j.status === 'error') {
+    stopQrPolling();
+    qrKey = null;
+    $('#qrStatus').textContent = j.error || j.message || '登录失败';
+  }
+}
+
+function openLogin() {
+  $('#loginModal').hidden = false;
+  renderLoginState();
+  if (!state.user) {
+    refreshQr();
+  } else {
+    stopQrPolling();
+    loadAcctFolders(); // 已登录：直接列出自己的收藏夹，勾选就能导入
+  }
+}
+
+function closeLogin() {
+  stopQrPolling();
+  $('#loginModal').hidden = true;
+}
+
+if ($('#acctBtn')) $('#acctBtn').addEventListener('click', openLogin);
+if ($('#loginClose')) $('#loginClose').addEventListener('click', closeLogin);
+if ($('#loginRefresh')) $('#loginRefresh').addEventListener('click', refreshQr);
+if ($('#loginModal')) {
+  $('#loginModal').addEventListener('click', (e) => {
+    if (e.target.id === 'loginModal') closeLogin();
+  });
+}
+if ($('#loginLogout')) {
+  $('#loginLogout').addEventListener('click', async () => {
+    try {
+      await fetch('/api/login/logout', { method: 'POST' });
+    } catch {
+      /* 忽略：本地照样清掉界面状态 */
+    }
+    state.user = null;
+    rememberUser(null);
+    renderAccount();
+    renderLoginState();
+    toast('已退出登录', 1600);
+    if (!$('#modal').hidden && modalTab === 'mine') loadMineFolders();
+    if (!$('#favPickModal').hidden) loadFavFolders();
+    refreshQr();
+  });
+}
+
+/* ---------------- 添加到收藏夹 / 移动到收藏夹 ---------------- */
+
+let favPickTrack = null;
+let favPickMode = 'add'; // add | move
+let favPickFrom = ''; // move 时的源收藏夹 ID
+
+/** 当前列表如果是「B 站收藏夹」，返回它的 ID；搜索结果 / 合集 / 其它都返回 '' */
+function currentFavFolderId() {
+  if (state.listMode !== 'folder') return '';
+  const id = String(state.mediaId || '');
+  return /^\d+$/.test(id) ? id : '';
+}
+
+function closeFavPicker() {
+  $('#favPickModal').hidden = true;
+  $('#favPickErr').hidden = true;
+  favPickTrack = null;
+  favPickMode = 'add';
+  favPickFrom = '';
+}
+
+async function openFavPicker(track, opts = {}) {
+  if (!track || !track.bvid) return;
+  favPickTrack = track;
+  favPickMode = opts.mode === 'move' ? 'move' : 'add';
+  favPickFrom = favPickMode === 'move' ? String(opts.fromFolderId || '') : '';
+  $('#favPickTitle').textContent = favPickMode === 'move' ? '移动到收藏夹' : '添加到收藏夹';
+  $('#favPickTrack').textContent = track.title || '';
+  $('#favPickErr').hidden = true;
+  $('#favPickLogin').hidden = !!state.user;
+  $('#favPickModal').hidden = false;
+  await loadFavFolders();
+}
+
+async function loadFavFolders() {
+  const box = $('#favPickList');
+  if (!state.user) {
+    box.innerHTML =
+      '<div class="favpick-empty">登录 B 站后，才能把这首歌收藏进<b>你自己的</b>收藏夹</div>';
+    $('#favPickLogin').hidden = false;
+    return;
+  }
+  $('#favPickLogin').hidden = true;
+  box.innerHTML = '<div class="favpick-empty">正在读取你的收藏夹…</div>';
+  try {
+    const j = await api('/api/my/favs');
+    if (!j.ok) throw new Error(j.error || '读取收藏夹失败');
+    // 移动时不能选「当前所在的那个夹子」
+    const folders = (j.folders || []).filter((f) => !(favPickMode === 'move' && String(f.id) === favPickFrom));
+    if (!folders.length) {
+      box.innerHTML =
+        favPickMode === 'move'
+          ? '<div class="favpick-empty">你只有一个收藏夹，先去「+」里新建一个再移动</div>'
+          : '<div class="favpick-empty">你还没有创建过收藏夹，先去 B 站建一个吧</div>';
+      return;
+    }
+    box.innerHTML = '';
+    for (const f of folders) {
+      const el = document.createElement('button');
+      el.type = 'button';
+      el.className = 'favpick-item';
+      el.innerHTML = `
+        <div class="favpick-cover"${f.cover ? ` style="background-image:url('${imgUrl(f.cover, '@80w_80h_1c')}')"` : ''}></div>
+        <div class="favpick-body">
+          <div class="favpick-name">${escapeHtml(f.title)}${
+        f.isPrivate ? '<span class="favpick-tag">私密</span>' : ''
+      }</div>
+          <div class="favpick-count">${f.count} 首</div>
+        </div>`;
+      el.addEventListener('click', () => addToFavFolder(f));
+      box.appendChild(el);
+    }
+  } catch (e) {
+    if (/登录/.test(e.message)) {
+      state.user = null;
+      renderAccount();
+      $('#favPickLogin').hidden = false;
+    }
+    box.innerHTML = `<div class="favpick-empty">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+/** 移动成功后，把这首从当前列表里摘掉（歌还归 B 站那边管，界面得跟上） */
+function dropTrackFromCurrentList(track) {
+  const idx = state.tracks.findIndex((x) => x.bvid === track.bvid);
+  if (idx < 0) return;
+  state.tracks.splice(idx, 1);
+  state.playingIndex = state.playingTrack
+    ? state.tracks.findIndex((x) => x.bvid === state.playingTrack.bvid)
+    : -1;
+  state.shuffleQueue = [];
+  state.shufflePos = -1;
+  rebuildView();
+
+  const n = state.tracks.filter((t) => !t.dead).length;
+  if (state.info) state.info.count = n;
+  $('#favSub').textContent = `${n} 首 · ${(state.info && state.info.upper) || '我的收藏夹'} · 刚刚更新`;
+}
+
+async function addToFavFolder(folder) {
+  const t = favPickTrack;
+  if (!t) return;
+  const moving = favPickMode === 'move';
+  const from = favPickFrom;
+  const box = $('#favPickList');
+  box.querySelectorAll('button').forEach((b) => {
+    b.disabled = true;
+  });
+  $('#favPickErr').hidden = true;
+
+  try {
+    const r = await fetch('/api/fav/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        bvid: t.bvid,
+        avid: t.avid,
+        folderId: folder.id,
+        fromFolderId: moving ? from : '',
+      }),
+    });
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || '收藏失败');
+    closeFavPicker();
+
+    // B 站 code=0 就是成功（它的 success_num 永远是 0，不能拿来判断）
+    toast(moving ? `已移动到「${folder.title}」` : `已收藏到「${folder.title}」`, 2400);
+
+    // 侧栏数量跟着变
+    const bump = (id, delta) => {
+      const rec = state.folders.find((f) => String(f.mediaId) === String(id));
+      if (rec) rec.count = Math.max(0, (rec.count || 0) + delta);
+    };
+    bump(folder.id, 1);
+    if (moving) {
+      bump(from, -1);
+      if (String(state.mediaId) === from) dropTrackFromCurrentList(t);
+    }
+    persist();
+    renderFolders();
+  } catch (e) {
+    box.querySelectorAll('button').forEach((b) => {
+      b.disabled = false;
+    });
+    const err = $('#favPickErr');
+    err.hidden = false;
+    err.textContent = e.message;
+    if (/登录/.test(e.message)) {
+      state.user = null;
+      renderAccount();
+      $('#favPickLogin').hidden = false;
+    }
+  }
+}
+
+if ($('#favPickCancel')) $('#favPickCancel').addEventListener('click', closeFavPicker);
+if ($('#favPickLogin')) {
+  $('#favPickLogin').addEventListener('click', () => {
+    openLogin();
+  });
+}
+if ($('#favPickModal')) {
+  $('#favPickModal').addEventListener('click', (e) => {
+    if (e.target.id === 'favPickModal') closeFavPicker();
+  });
 }
 
 /** 只更新某一行的播放状态，避免整表重绘（列表长了会卡） */
@@ -432,9 +1453,304 @@ function refreshActiveRow() {
   });
 }
 
+/** 播放状态变了：列表视图只改一行，卡片视图（一页最多 24 个）整页重画更省事 */
+function refreshActiveUI() {
+  if (state.viewMode === 'card') {
+    renderCards();
+    return;
+  }
+  refreshActiveRow();
+}
+
 /* ---------------- 播放控制 ---------------- */
+/**
+ * 正在播放的那首。
+ * 以 state.playingTrack 为准而不是 playingIndex：列表可以换成搜索结果 / 别的收藏夹，
+ * 但正在响的那首不能因此变成 null（否则进度、历史、悬浮窗全断）。
+ */
 function currentTrack() {
+  if (state.playingTrack) return state.playingTrack;
   return state.playingIndex >= 0 ? state.tracks[state.playingIndex] : null;
+}
+
+/* ---------------- 手动播放列表（队列） ---------------- */
+
+/** 入队。at = 1 表示插到当前播放之后（「下一曲播放」），不传则追加队尾。
+ *  只入队不开播——不打断当前正在播的这首。 */
+function queueAdd(track, at) {
+  if (!track || !track.bvid) return false;
+  // 已经在队列里的就不重复加（按 bvid 去重）
+  if (state.queue.some((q) => q.bvid === track.bvid)) return false;
+  const copy = { ...track };
+  if (at === 1 && state.queue.length) {
+    state.queue.splice(1, 0, copy); // [0] 是正在播的，插到它后面
+  } else {
+    state.queue.push(copy);
+  }
+  renderQueuePanel();
+  return true;
+}
+
+/** 播队列里的第 i 首。队列模式下 queue[0] 始终代表「当前这首」 */
+function queuePlayAt(i) {
+  const t = state.queue[i];
+  if (!t) return;
+  // 播放队列和当前视图解耦：直接借用 playAt 的播放逻辑，
+  // 但 playAt 只认 state.tracks 下标，所以走一个代理：临时把
+  // playingTrack 设为目标，然后用 queueStep 接管 ended/下一首。
+  playQueuedTrack(t);
+}
+
+/** 队列专用播放：不走 playAt（它依赖 state.tracks 下标），自己设 src */
+function playQueuedTrack(t) {
+  if (!t || !t.bvid) return;
+  if (state.playingIndex >= 0) reportProgress(true);
+  histEnd();
+
+  state.playingTrack = t;
+  state.playingIndex = state.tracks.findIndex((x) => x.bvid === t.bvid); // 能对上就高亮，对不上就算了
+
+  const cover = t.cover ? imgUrl(t.cover, '@200w_200h_1c') : '';
+  $('#npCover').style.backgroundImage = cover ? `url('${cover}')` : '';
+  $('#npTitle').textContent = t.title;
+  $('#npUpper').textContent = t.upper || '—';
+  document.title = `${t.title} · ${t.upper || 'B站'}`;
+
+  pendingSeek = 0;
+  histBegin(t, 0);
+
+  audio.src = `/api/audio?bvid=${encodeURIComponent(t.bvid)}`;
+  audio.play().catch((e) => {
+    if (e && e.name === 'AbortError') return;
+    histSession = null;
+    toast('播放失败：' + (e.message || '未知错误'), 3000);
+  });
+
+  localStorage.setItem(LS.lastBvid, t.bvid);
+  refreshActiveUI();
+  updateProgressUI(0, t.duration);
+  setPlayingUI(true);
+  if (!npView.hidden) renderNp();
+  setTimeout(() => pushMiniState(true), 80);
+  renderQueuePanel();
+}
+
+/** 播完/手动下一首时：把队首（刚播完的）移除，下一首顶上来开播 */
+function queueAdvance() {
+  if (!state.queue.length) return false;
+  state.queue.shift();
+  if (state.queue.length) {
+    queuePlayAt(0);
+    return true;
+  }
+  return false;
+}
+
+/** 队列模式下删除第 i 首（正在播的不给删） */
+function queueRemove(i) {
+  if (i <= 0 || i >= state.queue.length) return;
+  state.queue.splice(i, 1);
+  renderQueuePanel();
+}
+
+function queueClearAll() {
+  // 保留正在播的那首（queue[0]），其余全清
+  if (state.queue.length) state.queue = [state.queue[0]];
+  renderQueuePanel();
+}
+
+function renderQueuePanel() {
+  const panel = $('#queuePanel');
+  const list = $('#queueList');
+  const count = $('#queueCount');
+  if (!panel || !list) return;
+  count.textContent = state.queue.length ? `${state.queue.length} 首` : '';
+  $('#queueClear').hidden = state.queue.length <= 1;
+
+  list.innerHTML = '';
+  if (!state.queue.length) {
+    const empty = document.createElement('div');
+    empty.className = 'queue-empty';
+    empty.textContent = '播放列表是空的。右键歌曲 →「添加到播放列表」试试';
+    list.appendChild(empty);
+    return;
+  }
+  state.queue.forEach((t, i) => {
+    const row = document.createElement('div');
+    row.className = 'queue-row' + (i === 0 ? ' now' : '');
+    row.draggable = i > 0;
+    row.dataset.i = i;
+
+    const cover = document.createElement('div');
+    cover.className = 'q-cover';
+    cover.style.backgroundImage = t.cover ? `url('${imgUrl(t.cover, '@120w_120h_1c')}')` : '';
+    row.appendChild(cover);
+
+    const text = document.createElement('div');
+    text.className = 'q-text';
+    const title = document.createElement('div');
+    title.className = 'q-title';
+    title.textContent = t.title || '(无标题)';
+    const sub = document.createElement('div');
+    sub.className = 'q-sub';
+    sub.textContent = t.upper || '';
+    text.appendChild(title);
+    text.appendChild(sub);
+    row.appendChild(text);
+
+    if (i === 0) {
+      const tag = document.createElement('span');
+      tag.className = 'q-now-tag';
+      tag.textContent = '正在播';
+      row.appendChild(tag);
+    } else {
+      const del = document.createElement('button');
+      del.className = 'q-del';
+      del.title = '从列表移除';
+      del.textContent = '✕';
+      del.addEventListener('click', (e) => {
+        e.stopPropagation();
+        queueRemove(i);
+      });
+      row.appendChild(del);
+    }
+
+    row.addEventListener('click', () => {
+      if (i === 0) return;
+      // 点队列中某首：把它之前的（不含队首）全部移除，它变成下一首直接播
+      state.queue.splice(1, i - 1);
+      queuePlayAt(1);
+    });
+
+    // 拖拽排序（队首不参与）
+    row.addEventListener('dragstart', (e) => {
+      e.dataTransfer.setData('text/plain', String(i));
+      row.classList.add('dragging');
+    });
+    row.addEventListener('dragend', () => row.classList.remove('dragging'));
+    row.addEventListener('dragover', (e) => {
+      if (i === 0) return;
+      e.preventDefault();
+      row.classList.add('drag-over');
+    });
+    row.addEventListener('dragleave', () => row.classList.remove('drag-over'));
+    row.addEventListener('drop', (e) => {
+      e.preventDefault();
+      row.classList.remove('drag-over');
+      const from = parseInt(e.dataTransfer.getData('text/plain'), 10);
+      if (isNaN(from) || from <= 0 || from === i || from >= state.queue.length) return;
+      const [moved] = state.queue.splice(from, 1);
+      state.queue.splice(Math.max(1, i), 0, moved);
+      renderQueuePanel();
+    });
+
+    list.appendChild(row);
+  });
+}
+
+function toggleQueuePanel() {
+  const panel = $('#queuePanel');
+  if (!panel) return;
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden) renderQueuePanel();
+}
+
+/* ---------------- 侧栏合集/收藏夹右键：整单入队 ---------------- */
+
+let ctxFolder = null; // 右键点的是哪个收藏夹/合集
+
+/** 拉一个收藏夹/合集的完整曲目列表（服务端有缓存，通常秒回） */
+async function fetchFolderTracks(mediaId) {
+  const season = parseSeasonKey(mediaId);
+  const q = season
+    ? `/api/season?mid=${encodeURIComponent(season.mid)}&season_id=${encodeURIComponent(season.seasonId)}`
+    : `/api/fav?media_id=${encodeURIComponent(mediaId)}`;
+  const data = await api(q);
+  if (!data.ok) throw new Error(data.error || '读取失败');
+  return (data.tracks || []).filter((t) => !t.dead && t.bvid);
+}
+
+/**
+ * 整单入队。mode:
+ *  append — 追加到队尾（跳过已在队列里的）
+ *  replace — 清掉待播部分，整单变成待播（正在播的保留）
+ */
+async function queueFolder(mediaId, mode) {
+  const f = ctxFolder;
+  const name = f ? f.title : '列表';
+  try {
+    toast(`正在读取「${name}」…`, 2000);
+    const tracks = await fetchFolderTracks(mediaId);
+    if (!tracks.length) return toast('这个列表里没有能播的歌', 2200);
+
+    if (mode === 'replace') {
+      // 保留正在播的（queue[0]），其余换掉；没有任何在播的就直接开播第一首
+      const cur = state.queue.length ? state.queue[0] : null;
+      state.queue = cur ? [cur, ...tracks] : [...tracks];
+      if (!cur && !hasLoaded()) queuePlayAt(0); // 什么都没在播：直接开播
+      toast(`播放列表已替换为「${name}」，${tracks.length} 首`, 2600);
+    } else {
+      // 追加：跳过已在队列里的（按 bvid 去重）
+      const have = new Set(state.queue.map((q) => q.bvid));
+      const fresh = tracks.filter((t) => !have.has(t.bvid));
+      if (!fresh.length) return toast('这些歌都已经在播放列表里了', 2200);
+      state.queue.push(...fresh);
+      // 队列原来完全是空的且没在播：直接开播第一首
+      if (state.queue.length === fresh.length && !hasLoaded()) queuePlayAt(0);
+      toast(`已把「${name}」的 ${fresh.length} 首加入播放列表`, 2600);
+    }
+    renderQueuePanel();
+  } catch (e) {
+    toast('操作失败：' + e.message, 3000);
+  }
+}
+
+/** 侧栏条目右键菜单（复用 #ctxMenu 样式，独立小菜单） */
+function showFolderContextMenu(x, y, f) {
+  let menu = $('#folderCtxMenu');
+  if (!menu) {
+    menu = document.createElement('div');
+    menu.id = 'folderCtxMenu';
+    menu.className = 'ctx-menu';
+    menu.hidden = true;
+    menu.innerHTML = `
+      <button class="ctx-item" data-action="q-append">添加到播放列表</button>
+      <button class="ctx-item" data-action="q-replace">替换播放列表</button>
+      <button class="ctx-item" data-action="q-open">打开列表</button>`;
+    document.body.appendChild(menu);
+
+    menu.addEventListener('click', (e) => {
+      const item = e.target.closest('.ctx-item');
+      if (!item) return;
+      const mediaId = menu.dataset.id;
+      const mode = item.dataset.action;
+      hideFolderCtxMenu();
+      if (mode === 'q-append') queueFolder(mediaId, 'append');
+      else if (mode === 'q-replace') queueFolder(mediaId, 'replace');
+      else if (mode === 'q-open') loadFolder(mediaId);
+    });
+
+    document.addEventListener('mousedown', (e) => {
+      if (!menu.hidden && !menu.contains(e.target)) hideFolderCtxMenu();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !menu.hidden) hideFolderCtxMenu();
+    });
+    window.addEventListener('blur', hideFolderCtxMenu);
+    window.addEventListener('scroll', hideFolderCtxMenu, true);
+  }
+  ctxFolder = f;
+  menu.dataset.id = f.mediaId;
+  menu.hidden = false;
+  const rect = menu.getBoundingClientRect();
+  const pad = 8;
+  menu.style.left = `${Math.max(pad, Math.min(x, window.innerWidth - rect.width - pad))}px`;
+  menu.style.top = `${Math.max(pad, Math.min(y, window.innerHeight - rect.height - pad))}px`;
+}
+
+function hideFolderCtxMenu() {
+  const menu = $('#folderCtxMenu');
+  if (menu) menu.hidden = true;
 }
 
 function playAt(trackIndex) {
@@ -447,6 +1763,15 @@ function playAt(trackIndex) {
   histEnd();
 
   state.playingIndex = trackIndex;
+  state.playingTrack = t;
+
+  // 手动播放列表对齐：主列表点歌 = 当前播放换成这首，队列待播部分保留
+  if (state.queue.length) {
+    const at = state.queue.findIndex((q) => q.bvid === t.bvid);
+    if (at >= 0) state.queue.splice(0, at, t); // 队首到它之间全去掉
+    else state.queue.splice(0, 1, t); // 队首换成它，后面待播的保留
+    renderQueuePanel();
+  }
 
   // 乱序模式下直接点列表里的某首：把它定位成队列中的当前位置，
   // 之后「下一首」从它往后走，「上一首」回到它前面那首
@@ -483,7 +1808,7 @@ function playAt(trackIndex) {
   });
 
   localStorage.setItem(LS.lastBvid, t.bvid);
-  refreshActiveRow();
+  refreshActiveUI();
   updateProgressUI(pendingSeek, t.duration);
   setPlayingUI(true);
   if (!npView.hidden) renderNp();
@@ -593,6 +1918,22 @@ function shufflePrev() {
 }
 
 function step(delta) {
+  if (!state.view.length && !state.queue.length) return;
+
+  // 手动播放列表非空：下一首沿队列走，上一首回到刚播过的那首
+  if (state.queue.length) {
+    if (delta > 0) {
+      queueAdvance();
+      return;
+    }
+    // delta < 0：把当前这首重新插回队首要播的位置（简单做法：重播当前）
+    const cur = state.queue[0];
+    if (cur) {
+      playQueuedTrack(cur);
+      return;
+    }
+  }
+
   if (!state.view.length) return;
 
   // 乱序模式下「下一首」和「上一首」都沿同一个乱序队列走，
@@ -829,7 +2170,20 @@ $('#shuffleAllBtn').addEventListener('click', () => {
   toast('乱序播放已开启', 1400);
 });
 
+/* ---------------- 播放列表面板 ---------------- */
+$('#queueBtn').addEventListener('click', toggleQueuePanel);
+$('#queueClose').addEventListener('click', toggleQueuePanel);
+$('#queueClear').addEventListener('click', () => {
+  queueClearAll();
+  toast('已清空（正在播的保留）', 1600);
+});
+
 $('#reloadBtn').addEventListener('click', () => {
+  // 搜索视图下「重新加载」= 重新搜一次当前关键词
+  if (state.listMode === 'search' && state.search) {
+    doSearch(state.search.keyword);
+    return;
+  }
   if (state.mediaId) loadFolder(state.mediaId, { force: true });
 });
 
@@ -842,23 +2196,181 @@ if (DESKTOP) {
 
   // 卡片上的按钮走和界面完全相同的逻辑，不另开一套
   DESKTOP.onCommand((cmd) => {
-    if (cmd === 'toggle') togglePlay();
-    else if (cmd === 'next') step(1);
-    else if (cmd === 'prev') step(-1);
-    // play() 是异步的，稍等一下再回推，卡片才不会显示成暂停态
+    const name = typeof cmd === 'string' ? cmd : cmd && cmd.type;
+    if (name === 'toggle') togglePlay();
+    else if (name === 'next') step(1);
+    else if (name === 'prev') step(-1);
+    else if (name === 'volume') {
+      const v = Number(cmd && cmd.value);
+      if (Number.isFinite(v)) {
+        state.volume = Math.min(1, Math.max(0, v));
+        if (state.volume > 0) state.muted = false; // 拖动音量即取消静音
+        applyVolume();
+      }
+    } else if (name === 'mute') {
+      state.muted = !state.muted;
+      applyVolume();
+    } else if (name === 'mode') {
+      const v = cmd && cmd.value;
+      if (v === 'list' || v === 'one' || v === 'shuffle') setMode(v);
+    } else if (name === 'queue') {
+      toggleQueuePanel();
+    }
+    // play()/音量变化是异步的，稍等一下再回推，卡片才不会显示旧状态
     setTimeout(() => pushMiniState(true), 60);
   });
 }
 
+/* 搜索框：打字 = 过滤本地列表；回车 / 点放大镜 = 去 B 站搜第一页 */
 let searchTimer = null;
 $('#searchInput').addEventListener('input', (e) => {
   clearTimeout(searchTimer);
   const v = e.target.value;
   searchTimer = setTimeout(() => {
+    if (state.listMode === 'search') {
+      // 搜索结果里再打字 = 准备下一次搜索，回车才真的发出去
+      const kw = v.trim();
+      const s = state.search;
+      showSearchBar(kw && s && kw !== s.keyword ? `按回车在 B 站搜索「${kw}」` : searchBarText());
+      return;
+    }
     state.query = v;
     rebuildView();
   }, 140);
 });
+
+$('#searchInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    clearTimeout(searchTimer);
+    doSearch(e.target.value);
+  } else if (e.key === 'Escape') {
+    // 清空搜索框；在搜索视图里等于「返回列表」
+    e.target.value = '';
+    if (state.listMode === 'search') {
+      exitSearch();
+    } else if (state.query) {
+      state.query = '';
+      rebuildView();
+    }
+  }
+});
+
+const searchGoBtn = $('#searchGoBtn');
+if (searchGoBtn) {
+  searchGoBtn.addEventListener('click', () => {
+    const input = $('#searchInput');
+    const v = input.value.trim() || (state.search && state.search.keyword) || '';
+    doSearch(v);
+    input.focus();
+  });
+}
+
+const searchBackBtn = $('#searchBackBtn');
+if (searchBackBtn) searchBackBtn.addEventListener('click', exitSearch);
+
+/* ---------------- 主题（深色 / 白天） ---------------- */
+const THEME_KEY = 'bfp.theme';
+
+/** theme: 'dark' | 'light'。remember=false 用于启动时同步按钮，不覆盖已存的值 */
+function applyTheme(theme, remember = true) {
+  const t = theme === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = t;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', t === 'light' ? '#f4f5f7' : '#0d0a10');
+  const btn = $('#themeBtn');
+  if (btn) {
+    btn.classList.toggle('light', t === 'light');
+    btn.title = t === 'light' ? '切换到夜间主题' : '切换到白天主题';
+  }
+  // 桌面端：原生标题栏（右上角窗口按钮那条）由主进程画，得告诉它一声
+  if (DESKTOP && typeof DESKTOP.reportTheme === 'function') DESKTOP.reportTheme(t);
+  if (remember) {
+    try {
+      localStorage.setItem(THEME_KEY, t);
+    } catch {
+      /* 隐私模式下写不进去，无所谓 */
+    }
+  }
+}
+
+function toggleTheme() {
+  applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+}
+
+if ($('#themeBtn')) $('#themeBtn').addEventListener('click', toggleTheme);
+// 页面 head 里的内联脚本已经先设过一次，这里只是把按钮状态对上
+applyTheme(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark', false);
+
+// 列表 / 卡片视图切换
+if ($('#viewBtn')) {
+  $('#viewBtn').addEventListener('click', () => setViewMode(state.viewMode === 'card' ? 'list' : 'card'));
+}
+
+/* ---------------- 侧栏宽度可拖动 ---------------- */
+const SIDE_W_KEY = 'bfp.sideW';
+const SIDE_MIN = 168;
+const SIDE_MAX = 460;
+
+(function initSideResizer() {
+  const root = document.documentElement;
+  const bar = $('#sideResizer');
+  const sidebar = document.querySelector('.sidebar');
+  if (!bar || !sidebar) return;
+
+  // 记住上次拖的宽度
+  const saved = parseFloat(localStorage.getItem(SIDE_W_KEY));
+  if (Number.isFinite(saved) && saved >= SIDE_MIN && saved <= SIDE_MAX) {
+    root.style.setProperty('--side-w', `${Math.round(saved)}px`);
+  }
+
+  let dragging = false;
+  let startX = 0;
+  let startW = 0;
+
+  const setWidth = (w) => root.style.setProperty('--side-w', `${Math.round(Math.min(SIDE_MAX, Math.max(SIDE_MIN, w)))}px`);
+
+  bar.addEventListener('pointerdown', (e) => {
+    if (window.innerWidth <= 720) return; // 手机上侧栏是横向条，没有可拖的竖边
+    dragging = true;
+    startX = e.clientX;
+    startW = sidebar.getBoundingClientRect().width;
+    bar.classList.add('dragging');
+    document.body.classList.add('resizing');
+    try {
+      bar.setPointerCapture(e.pointerId);
+    } catch {}
+    e.preventDefault();
+  });
+
+  bar.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    setWidth(startW + (e.clientX - startX));
+  });
+
+  const end = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    bar.classList.remove('dragging');
+    document.body.classList.remove('resizing');
+    try {
+      bar.releasePointerCapture(e.pointerId);
+    } catch {}
+    try {
+      localStorage.setItem(SIDE_W_KEY, String(Math.round(sidebar.getBoundingClientRect().width)));
+    } catch {}
+  };
+  bar.addEventListener('pointerup', end);
+  bar.addEventListener('pointercancel', end);
+
+  // 双击恢复默认宽度
+  bar.addEventListener('dblclick', () => {
+    root.style.removeProperty('--side-w');
+    try {
+      localStorage.removeItem(SIDE_W_KEY);
+    } catch {}
+  });
+})();
 
 /* audio 事件 */
 audio.addEventListener('timeupdate', () => {
@@ -892,11 +2404,13 @@ audio.addEventListener('pause', () => {
   pushMiniState(true);
 });
 audio.addEventListener('ended', () => {
-  if (state.mode === 'one') {
+  if (state.mode === 'one' && !state.queue.length) {
     audio.currentTime = 0;
     audio.play().catch(() => {});
     return;
   }
+  // 手动播放列表非空时优先走队列
+  if (queueAdvance()) return;
   step(1);
 });
 audio.addEventListener('error', () => {
@@ -909,7 +2423,7 @@ audio.addEventListener('error', () => {
     updateProgressUI(0, 0);
     return;
   }
-  if (state.playingIndex < 0) return;
+  if (!currentTrack()) return;
   histSession = null; // 这首放不出来，别把半截会话带到下一首
   toast('这首放不出来，跳过', 1800);
   setTimeout(() => step(1), 500);
@@ -967,6 +2481,10 @@ document.addEventListener('keydown', (e) => {
       state.muted = !state.muted;
       applyVolume();
       break;
+    case 'q':
+    case 'Q':
+      toggleQueuePanel();
+      break;
     default:
       break;
   }
@@ -1002,7 +2520,7 @@ function reportProgress(force = false) {
     bvid: t.bvid,
     pos: audio.currentTime,
     dur: totalDuration(),
-    mediaId: state.mediaId,
+    mediaId: listId(),
   });
 
   // 关页面时普通 fetch 会被浏览器掐掉，用 sendBeacon 才发得出去
@@ -1034,7 +2552,7 @@ function histBegin(t, fromSec) {
     title: t.title || '',
     upper: t.upper || '',
     cover: t.cover ? imgUrl(t.cover, '@120w_120h_1c') : '',
-    mediaId: state.mediaId,
+    mediaId: listId(),
     dur: t.duration || 0, // 这首歌总长
     at: Date.now(),
     base: Number(fromSec) || 0, // 这次是从第几秒开始听的
@@ -1357,12 +2875,16 @@ document.addEventListener('visibilitychange', () => {
 /* ---------------- 添加收藏夹 ---------------- */
 let modalTab = 'folder';
 
-function openModal() {
+function openModal(tab) {
+  // 登录了就直接落在「我的收藏夹」——那才是导入自己夹子的入口
+  if (tab) modalTab = tab;
+  else if (state.user) modalTab = 'mine';
   $('#modal').hidden = false;
   $('#modalErr').hidden = true;
   setModalTab(modalTab);
   setTimeout(() => {
-    (modalTab === 'folder' ? $('#folderInput') : $('#uidInput')).focus();
+    const sel = { folder: '#folderInput', uid: '#uidInput', season: '#seasonInput' }[modalTab];
+    if (sel) $(sel).focus();
   }, 40);
 }
 
@@ -1375,18 +2897,285 @@ function setModalTab(tab) {
   modalTab = tab;
   document.querySelectorAll('.modal-tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   document.querySelectorAll('[data-panel]').forEach((p) => (p.hidden = p.dataset.panel !== tab));
+  const ok = $('#modalOk');
+  if (ok) ok.textContent = tab === 'mine' ? '导入选中' : '确定';
+  if (tab === 'mine') loadMineFolders();
+}
+
+/* ---- 我的收藏夹（登录后直接勾选导入；侧栏「+」和头像里的导入页共用） ---- */
+
+async function renderMyFoldersInto(box, hintEl) {
+  if (!box) return;
+
+  if (!state.user) {
+    if (hintEl) hintEl.textContent = '需要先登录';
+    box.innerHTML =
+      '<div class="mine-empty">登录 B 站后，这里会列出你自己的收藏夹（含私密夹）' +
+      '<br><button class="ghost-btn mine-login mine-login-btn" type="button">登录 B 站</button></div>';
+    const btn = box.querySelector('.mine-login-btn');
+    if (btn) btn.addEventListener('click', () => openLogin());
+    return;
+  }
+
+  if (hintEl) hintEl.textContent = '勾选要导入的收藏夹，可以多选';
+  box.innerHTML = '<div class="mine-empty">正在读取你的收藏夹…</div>';
+  try {
+    const j = await api('/api/my/favs');
+    if (!j.ok) throw new Error(j.error || '读取收藏夹失败');
+    const folders = j.folders || [];
+    if (!folders.length) {
+      box.innerHTML = '<div class="mine-empty">你还没有创建过收藏夹，先去 B 站建一个吧</div>';
+      return;
+    }
+    box.innerHTML = '';
+    for (const f of folders) {
+      const added = state.folders.some((x) => String(x.mediaId) === String(f.id));
+      const el = document.createElement('label');
+      el.className = 'mine-item' + (added ? ' added' : '');
+      el.innerHTML = `
+        <input type="checkbox" value="${escapeAttr(f.id)}"${added ? ' disabled' : ''} />
+        <span class="mine-name">${escapeHtml(f.title)}${
+        f.isPrivate ? '<span class="favpick-tag">私密</span>' : ''
+      }</span>
+        <span class="mine-count">${added ? '已添加' : `${f.count} 首`}</span>`;
+      box.appendChild(el);
+    }
+  } catch (e) {
+    if (/登录/.test(e.message)) {
+      state.user = null;
+      rememberUser(null);
+      renderAccount();
+    }
+    box.innerHTML = `<div class="mine-empty">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function loadMineFolders() {
+  return renderMyFoldersInto($('#mineList'), $('#mineHint'));
+}
+
+/** 头像里那个导入页 */
+function loadAcctFolders() {
+  return renderMyFoldersInto($('#acctFolderList'), $('#acctImportHint'));
+}
+
+/** 批量把「我的收藏夹」加进侧栏；单个失败不影响其他 */
+async function importMyFolders(ids) {
+  const todo = ids.filter((id) => !state.folders.some((f) => String(f.mediaId) === String(id)));
+  if (!todo.length) {
+    toast('这些收藏夹已经在列表里了', 2200);
+    return;
+  }
+
+  let added = 0;
+  let firstId = null;
+  let firstErr = '';
+
+  for (const id of todo) {
+    try {
+      const data = await api(`/api/fav?media_id=${encodeURIComponent(id)}&refresh=1`);
+      if (!data.ok) throw new Error(data.error || '读取失败');
+      const count = (data.tracks || []).filter((t) => !t.dead).length;
+      state.folders.push({
+        mediaId: String(id),
+        title: (data.info && data.info.title) || '收藏夹 ' + id,
+        count,
+        cover: (data.info && data.info.cover) || '',
+        upper: (data.info && data.info.upper) || '',
+      });
+      added += 1;
+      if (!firstId) firstId = id;
+    } catch (e) {
+      if (!firstErr) firstErr = e.message;
+    }
+  }
+
+  if (!added) throw new Error('导入失败：' + (firstErr || '未知原因'));
+
+  persist();
+  renderFolders();
+  if (firstId) await loadFolder(firstId);
+  toast(added > 1 ? `已导入 ${added} 个收藏夹` : '已导入 1 个收藏夹', 2400);
+}
+
+/** 「全选 / 全不选」按钮，两个勾选列表共用 */
+function bindSelectAll(btnSel, listSel) {
+  const btn = $(btnSel);
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const boxes = [...document.querySelectorAll(`${listSel} input[type="checkbox"]:not(:disabled)`)];
+    if (!boxes.length) return;
+    const allOn = boxes.every((b) => b.checked);
+    boxes.forEach((b) => {
+      b.checked = !allOn;
+    });
+    btn.textContent = allOn ? '全选' : '全不选';
+  });
+}
+
+bindSelectAll('#mineAll', '#mineList');
+bindSelectAll('#acctImportAll', '#acctFolderList');
+
+/** 头像导入页里的「导入选中」 */
+if ($('#acctImportBtn')) {
+  $('#acctImportBtn').addEventListener('click', async () => {
+    const ids = [
+      ...document.querySelectorAll('#acctFolderList input[type="checkbox"]:checked:not(:disabled)'),
+    ].map((b) => b.value);
+    if (!ids.length) {
+      toast('先勾选要导入的收藏夹', 2000);
+      return;
+    }
+    const btn = $('#acctImportBtn');
+    const old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = `导入中（${ids.length}）…`;
+    try {
+      await importMyFolders(ids);
+      closeLogin();
+    } catch (e) {
+      toast(e.message, 3200);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = old;
+    }
+  });
 }
 
 document.querySelectorAll('.modal-tab').forEach((b) => {
   b.addEventListener('click', () => setModalTab(b.dataset.tab));
 });
 
-$('#addFolderBtn').addEventListener('click', openModal);
-$('#addFolderMobile').addEventListener('click', openModal);
 $('#modalCancel').addEventListener('click', closeModal);
 $('#modal').addEventListener('click', (e) => {
   if (e.target.id === 'modal') closeModal();
 });
+
+/* ---------------- 「+」：导入 / 新建收藏夹 ---------------- */
+
+function closeAddMenu() {
+  const m = $('#addMenu');
+  if (m) m.hidden = true;
+}
+
+function openAddMenu(anchor) {
+  const menu = $('#addMenu');
+  if (!menu || !anchor) return;
+  menu.hidden = false;
+  const r = anchor.getBoundingClientRect();
+  const pad = 8;
+  const mw = menu.offsetWidth;
+  const mh = menu.offsetHeight;
+  let left = Math.min(Math.max(pad, r.right - mw), window.innerWidth - mw - pad);
+  let top = r.bottom + 6;
+  if (top + mh > window.innerHeight - pad) top = Math.max(pad, r.top - mh - 6);
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+}
+
+[['#addFolderBtn'], ['#addFolderMobile']].forEach(([sel]) => {
+  const btn = $(sel);
+  if (!btn) return;
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (!$('#addMenu').hidden) {
+      closeAddMenu();
+      return;
+    }
+    openAddMenu(btn);
+  });
+});
+
+if ($('#addMenu')) {
+  $('#addMenu').addEventListener('click', (e) => {
+    const item = e.target.closest('.add-menu-item');
+    if (!item) return;
+    const act = item.dataset.act;
+    closeAddMenu();
+    if (act === 'import') openModal();
+    else if (act === 'create') openNewFolderModal();
+  });
+  document.addEventListener('mousedown', (e) => {
+    const m = $('#addMenu');
+    if (m && !m.hidden && !m.contains(e.target)) closeAddMenu();
+  });
+  window.addEventListener('resize', closeAddMenu);
+  window.addEventListener('blur', closeAddMenu);
+}
+
+/* ---- 新建收藏夹（建在 B 站账号里） ---- */
+
+function closeNewFolderModal() {
+  $('#newFolderModal').hidden = true;
+  $('#newFolderErr').hidden = true;
+}
+
+function openNewFolderModal() {
+  if (!state.user) {
+    toast('先登录 B 站才能新建收藏夹', 2400);
+    openLogin();
+    return;
+  }
+  $('#newFolderName').value = '';
+  $('#newFolderPrivate').checked = false;
+  $('#newFolderErr').hidden = true;
+  $('#newFolderModal').hidden = false;
+  setTimeout(() => $('#newFolderName').focus(), 40);
+}
+
+if ($('#newFolderCancel')) $('#newFolderCancel').addEventListener('click', closeNewFolderModal);
+if ($('#newFolderModal')) {
+  $('#newFolderModal').addEventListener('click', (e) => {
+    if (e.target.id === 'newFolderModal') closeNewFolderModal();
+  });
+}
+if ($('#newFolderName')) {
+  $('#newFolderName').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('#newFolderOk').click();
+  });
+}
+if ($('#newFolderOk')) {
+  $('#newFolderOk').addEventListener('click', async () => {
+    const btn = $('#newFolderOk');
+    const err = $('#newFolderErr');
+    const name = $('#newFolderName').value.trim();
+    err.hidden = true;
+    if (!name) {
+      err.hidden = false;
+      err.textContent = '先给收藏夹起个名字';
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const r = await fetch('/api/fav/folder/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: name, privacy: $('#newFolderPrivate').checked }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || '新建失败');
+      closeNewFolderModal();
+      toast(`已新建收藏夹「${j.item.title}」`, 2400);
+      // 顺手加到左边列表，马上就能往里收藏（提示已经在上面给过了）
+      try {
+        await addFolder(j.item.id, { silent: true });
+      } catch (e) {
+        toast('新建成功，但没加进列表：' + e.message, 3200);
+      }
+      if (!$('#modal').hidden && modalTab === 'mine') loadMineFolders();
+    } catch (e) {
+      err.hidden = false;
+      err.textContent = e.message;
+      if (/登录/.test(e.message)) {
+        state.user = null;
+        rememberUser(null);
+        renderAccount();
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
 
 function modalError(msg) {
   const el = $('#modalErr');
@@ -1402,6 +3191,13 @@ $('#modalOk').addEventListener('click', async () => {
   try {
     if (modalTab === 'folder') {
       const raw = $('#folderInput').value;
+      const season = parseSeason(raw);
+      if (season) {
+        await addSeason(season);
+        closeModal();
+        $('#folderInput').value = '';
+        return;
+      }
       const mediaId = parseMediaId(raw);
       if (!mediaId) {
         modalError('没识别出收藏夹 ID。请粘贴完整网址，或直接填纯数字 ID。');
@@ -1410,6 +3206,25 @@ $('#modalOk').addEventListener('click', async () => {
       await addFolder(mediaId);
       closeModal();
       $('#folderInput').value = '';
+    } else if (modalTab === 'season') {
+      const season = parseSeason($('#seasonInput').value);
+      if (!season) {
+        modalError('没识别出合集。请粘贴形如 space.bilibili.com/<uid>/lists/<合集ID>?type=season 的网址。');
+        return;
+      }
+      await addSeason(season);
+      closeModal();
+      $('#seasonInput').value = '';
+    } else if (modalTab === 'mine') {
+      const ids = [...document.querySelectorAll('#mineList input[type="checkbox"]:checked:not(:disabled)')].map(
+        (b) => b.value
+      );
+      if (!ids.length) {
+        modalError('先勾选要导入的收藏夹');
+        return;
+      }
+      await importMyFolders(ids);
+      closeModal();
     } else {
       const uid = parseUid($('#uidInput').value);
       if (!uid) {
@@ -1428,13 +3243,13 @@ $('#modalOk').addEventListener('click', async () => {
 });
 
 // 回车提交
-['#folderInput', '#uidInput'].forEach((sel) => {
+['#folderInput', '#uidInput', '#seasonInput'].forEach((sel) => {
   $(sel).addEventListener('keydown', (e) => {
     if (e.key === 'Enter') $('#modalOk').click();
   });
 });
 
-async function addFolder(mediaId) {
+async function addFolder(mediaId, opts = {}) {
   if (state.folders.some((f) => String(f.mediaId) === String(mediaId))) {
     // 已存在，直接切过去
     await loadFolder(mediaId);
@@ -1455,7 +3270,42 @@ async function addFolder(mediaId) {
   persist();
   renderFolders();
   await loadFolder(mediaId);
-  toast(`已添加「${(data.info && data.info.title) || mediaId}」，${count} 首`);
+  if (!opts.silent) toast(`已添加「${(data.info && data.info.title) || mediaId}」，${count} 首`);
+}
+
+/**
+ * 把一个合集加进侧栏。
+ * opts.keepView：加完不切过去（从搜索结果右键「导入整个合集」时用，别把人踢出搜索页）
+ */
+async function addSeason(season, opts = {}) {
+  const key = seasonKey(season);
+  const exists = state.folders.some((f) => String(f.mediaId) === key);
+  if (exists) {
+    if (opts.keepView) {
+      toast('这个合集已经在左边列表里了', 2200);
+      return;
+    }
+    await loadFolder(key);
+    return;
+  }
+
+  const data = await api(
+    `/api/season?mid=${encodeURIComponent(season.mid)}&season_id=${encodeURIComponent(season.seasonId)}&refresh=1`
+  );
+  if (!data.ok) throw new Error(data.error || '添加合集失败');
+
+  const count = (data.tracks || []).filter((t) => !t.dead).length;
+  state.folders.push({
+    mediaId: key,
+    title: (data.info && data.info.title) || `合集 ${season.seasonId}`,
+    count,
+    cover: (data.info && data.info.cover) || '',
+    upper: (data.info && data.info.upper) || '',
+  });
+  persist();
+  renderFolders();
+  if (!opts.keepView) await loadFolder(key);
+  toast(`已添加合集「${(data.info && data.info.title) || season.seasonId}」，${count} 首`, 2600);
 }
 
 async function importByUid(uid) {
@@ -1513,11 +3363,12 @@ function restoreLast() {
     if (!t || t.dead) return;
 
     state.playingIndex = ti;
+    state.playingTrack = t;
     const cover = t.cover ? imgUrl(t.cover, '@200w_200h_1c') : '';
     $('#npCover').style.backgroundImage = cover ? `url('${cover}')` : '';
     $('#npTitle').textContent = t.title;
     $('#npUpper').textContent = t.upper || '—';
-    refreshActiveRow();
+    refreshActiveUI();
 
     const pos = last && last.bvid === bvid ? Number(last.pos) || 0 : 0;
 
@@ -1546,10 +3397,24 @@ async function init() {
   setMode(MODE_ORDER.includes(m) ? m : 'list');
   applyVolume();
 
+  // 上次用的是列表还是卡片视图
+  setViewMode(localStorage.getItem(LS.view) === 'card' ? 'card' : 'list', false);
+
   // 收藏夹列表从服务端 json 读
   const lib = await fetchLibrary();
   state.folders = lib.folders;
   renderFolders();
+
+  // 登录态：凭证（Cookie）只存在服务端 data/auth.json，这里只拿昵称/头像
+  try {
+    const me = await api('/api/login/me');
+    state.user = me && me.isLogin ? me.user : null;
+  } catch {
+    // 服务端暂时连不上：先用本机缓存的名字撑着，别显示成掉线
+    state.user = cachedUser();
+  }
+  rememberUser(state.user);
+  renderAccount();
 
   // 支持用 ?media_id=xxx / ?fid=xxx 直达某个收藏夹（可存成书签）
   const qp = new URLSearchParams(location.search);
@@ -1582,16 +3447,19 @@ async function init() {
     const hint = $('#gateHint');
 
     const submit = async () => {
-      const mediaId = parseMediaId(input.value);
-      if (!mediaId) {
-        hint.textContent = '没识别出收藏夹 ID，检查一下链接？';
+      const raw = input.value;
+      const season = parseSeason(raw);
+      const mediaId = parseMediaId(raw);
+      if (!season && !mediaId) {
+        hint.textContent = '没识别出收藏夹或合集，检查一下链接？';
         hint.classList.add('error');
         return;
       }
       btn.disabled = true;
       btn.textContent = '加载中…';
       try {
-        await addFolder(mediaId);
+        if (season) await addSeason(season);
+        else await addFolder(mediaId);
       } catch (e) {
         hint.textContent = e.message;
         hint.classList.add('error');

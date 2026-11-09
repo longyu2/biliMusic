@@ -23,28 +23,45 @@
     position: absolute;
     inset: 6px;
     border-radius: 16px;
-    background: rgba(17, 14, 23, 0.94);
-    border: 1px solid rgba(255, 255, 255, 0.085);
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.4);
+    background: #110e17;
+    border: 1px solid transparent; /* 保留宽度占位，但不再画半透明描边 */
+    box-shadow: none;
     display: flex;
     align-items: center;
     gap: 12px;
     padding: 12px 14px 14px;
     overflow: hidden;
-    /* 整块都能拖窗口；按钮单独设 no-drag */
-    -webkit-app-region: drag;
+    /* 不用原生 app-region: drag——drag 区域右键会被 Electron 拦成系统菜单。
+       拖动由渲染进程 pointer 事件自绘上报（和封面同一套机制） */
+    transition: inset 0.28s cubic-bezier(0.2, 0.8, 0.25, 1),
+      border-radius 0.28s cubic-bezier(0.2, 0.8, 0.25, 1),
+      padding 0.28s cubic-bezier(0.2, 0.8, 0.25, 1),
+      background 0.28s;
   }
 
   .art {
+    /* 绝对定位才能让收起/展开时封面在屏幕上的位置保持不动（flex 布局下会被挤压） */
+    position: absolute;
+    left: 14px;
+    top: 50%;
+    margin-top: -29px;
     width: 58px;
     height: 58px;
-    flex-shrink: 0;
     border-radius: 50%;
     background: #1b1722 center / cover no-repeat;
     border: 1px solid rgba(255, 255, 255, 0.1);
     box-shadow: 0 0 18px 2px rgba(0, 0, 0, 0.5);
     animation: spin 26s linear infinite;
     animation-play-state: paused;
+    /* 不是原生拖拽区，才能收到点击；拖动由渲染进程自己上报 */
+    -webkit-app-region: no-drag;
+    cursor: pointer;
+    transition: left 0.28s cubic-bezier(0.2, 0.8, 0.25, 1),
+      top 0.28s cubic-bezier(0.2, 0.8, 0.25, 1),
+      margin-top 0.28s cubic-bezier(0.2, 0.8, 0.25, 1),
+      width 0.28s cubic-bezier(0.2, 0.8, 0.25, 1),
+      height 0.28s cubic-bezier(0.2, 0.8, 0.25, 1),
+      border-color 0.28s, box-shadow 0.28s;
   }
   .art.playing { animation-play-state: running; }
 
@@ -53,9 +70,11 @@
   .meta {
     flex: 1;
     min-width: 0;
+    margin-left: 70px; /* 给绝对定位的封面让位，和原来 flex 间距一致 */
     display: flex;
     flex-direction: column;
     gap: 4px;
+    transition: opacity 0.16s ease;
   }
 
   .title {
@@ -83,6 +102,7 @@
     gap: 1px;
     flex-shrink: 0;
     -webkit-app-region: no-drag;
+    transition: opacity 0.16s ease;
   }
 
   button {
@@ -124,6 +144,59 @@
   .card:hover .expand { opacity: 1; }
   .expand:hover { color: #fff; background: rgba(255, 255, 255, 0.1); }
 
+  /* 右侧控制组末尾的左箭头：手动收成小球 */
+  .btns .collapse {
+    width: 24px;
+    height: 24px;
+    margin-left: 2px;
+    border-radius: 6px;
+    color: rgba(255, 255, 255, 0.38);
+    flex-shrink: 0;
+  }
+  .btns .collapse:hover { color: #fff; background: rgba(255, 255, 255, 0.1); }
+
+  /* 音量 */
+  .vol {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    -webkit-app-region: no-drag;
+  }
+
+  .vol-btn {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    border-radius: 4px;
+    color: #a09bab;
+  }
+  .vol-btn:hover { background: transparent; color: #fff; }
+
+  #vol {
+    -webkit-appearance: none;
+    appearance: none;
+    flex: 1;
+    min-width: 0;
+    height: 14px;
+    background: transparent;
+    cursor: pointer;
+  }
+  #vol::-webkit-slider-runnable-track {
+    height: 3px;
+    border-radius: 2px;
+    background: linear-gradient(90deg, #fb7299 var(--vol, 80%), rgba(255, 255, 255, 0.16) var(--vol, 80%));
+  }
+  #vol::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 10px;
+    height: 10px;
+    margin-top: -3.5px;
+    border-radius: 50%;
+    background: #fff;
+    border: 1px solid #fb7299;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  }
+
   .bar {
     position: absolute;
     left: 14px;
@@ -143,16 +216,54 @@
     transition: width 0.25s linear;
   }
 
+  /* 拖出屏幕后的小球：只留旋转封面，点一下恢复卡片 */
+  body.ball .card {
+    inset: 5px;
+    padding: 0;
+    gap: 0;
+    border-radius: 50%;
+    background: #1b1722;
+    /* 球自己上报拖动，不能用原生拖拽区：拖拽区会把真实鼠标点击吞掉 */
+    -webkit-app-region: no-drag;
+    cursor: grab;
+  }
+  body.ball .art {
+    left: 0;
+    top: 0;
+    margin-top: 0;
+    width: 56px;
+    height: 56px;
+    border-color: transparent;
+    box-shadow: none;
+  }
+  body.ball .meta,
+  body.ball .btns { opacity: 0; pointer-events: none; }
+  body.ball .bar,
+  body.ball .expand { display: none; }
+
   .hide { display: none !important; }
 </style>
 </head>
 <body>
   <div class="card">
-    <div class="art" id="art"></div>
+    <div class="art" id="art" title="点击收起 / 展开"></div>
 
     <div class="meta">
       <div class="title" id="title">未在播放</div>
       <div class="sub" id="sub">在播放器里点一首歌开始</div>
+      <div class="vol">
+        <button id="volBtn" class="vol-btn" title="静音">
+          <svg id="icoVol" viewBox="0 0 24 24" width="13" height="13">
+            <path d="M4 9.5h3.2L11.5 6v12L7.2 14.5H4z" fill="currentColor"/>
+            <path d="M14.5 9a4 4 0 0 1 0 6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          </svg>
+          <svg id="icoMute" class="hide" viewBox="0 0 24 24" width="13" height="13">
+            <path d="M4 9.5h3.2L11.5 6v12L7.2 14.5H4z" fill="currentColor"/>
+            <path d="M15 9.5l4 5M19 9.5l-4 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <input id="vol" type="range" min="0" max="100" step="1" value="80" aria-label="音量" />
+      </div>
     </div>
 
     <div class="btns">
@@ -165,6 +276,9 @@
       </button>
       <button id="next" title="下一首">
         <svg viewBox="0 0 24 24" width="15" height="15"><path d="M7 5 L17 12 L7 19 Z" fill="currentColor"/><rect x="17.9" y="5" width="1.9" height="14" rx="0.9" fill="currentColor"/></svg>
+      </button>
+      <button id="toBall" class="collapse" title="收起为小球">
+        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M15 5 L8 12 L15 19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
     </div>
 
@@ -179,8 +293,11 @@
   const $ = (s) => document.querySelector(s);
   const api = window.mini;
 
-  let st = { title: '', upper: '', cover: '', playing: false, pos: 0, dur: 0 };
+  let st = { title: '', upper: '', cover: '', playing: false, pos: 0, dur: 0, volume: 0.8, muted: false };
   let stamp = 0; // 收到状态的时刻，用来本地插值推进度
+
+  const vol = $('#vol');
+  let volDragging = false;
 
   const fmt = (sec) => {
     if (!Number.isFinite(sec) || sec < 0) sec = 0;
@@ -204,6 +321,19 @@
     $('#art').classList.toggle('playing', !!st.playing);
     $('#icoPlay').classList.toggle('hide', !!st.playing);
     $('#icoPause').classList.toggle('hide', !st.playing);
+    renderVolume();
+  }
+
+  function renderVolume() {
+    const v = Number.isFinite(st.volume) ? st.volume : 0.8;
+    const pct = Math.round(v * 100);
+    // 拖动时不要被回推的状态拽回去
+    if (!volDragging) {
+      vol.value = String(pct);
+      vol.style.setProperty('--vol', pct + '%');
+    }
+    $('#icoVol').classList.toggle('hide', !!st.muted || pct === 0);
+    $('#icoMute').classList.toggle('hide', !st.muted);
   }
 
   // 主进程每秒只推一次状态，进度条靠本地插值才不会一跳一跳
@@ -228,10 +358,70 @@
       render();
     });
 
+    api.onMode((mode) => {
+      document.body.classList.toggle('ball', mode === 'ball');
+    });
+
     $('#play').addEventListener('click', () => api.command('toggle'));
     $('#prev').addEventListener('click', () => api.command('prev'));
     $('#next').addEventListener('click', () => api.command('next'));
     $('#expand').addEventListener('click', () => api.expand());
+    $('#toBall').addEventListener('click', () => api.collapse());
+
+    vol.addEventListener('pointerdown', () => {
+      volDragging = true;
+    });
+    vol.addEventListener('input', () => {
+      const pct = Number(vol.value);
+      vol.style.setProperty('--vol', pct + '%');
+      api.command({ type: 'volume', value: pct / 100 });
+    });
+    vol.addEventListener('change', () => {
+      volDragging = false;
+    });
+    window.addEventListener('pointerup', () => {
+      volDragging = false;
+    });
+    $('#volBtn').addEventListener('click', () => api.command('mute'));
+
+    // 右键菜单由主进程 webContents 'context-menu' 事件处理（drag 区域也能收到）
+
+    // 拖动：整张卡片都能拖（不再用原生 app-region，否则右键会被吃掉）；
+    // 封面点一下切换卡片/小球
+    let drag = null;
+    const endDrag = (e) => {
+      if (!drag || (e && e.pointerId !== drag.id)) return;
+      const st = drag;
+      drag = null;
+      api.dragEnd(st.moved);
+      if (st.moved) return;
+      if (!st.art) return; // 只有点封面才切换形态，点别处不误触
+      if (st.ball) api.card();
+      else api.collapse();
+    };
+    document.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      // 按钮、音量条等交互元素不参与拖拽
+      if (e.target.closest('button, input, .vol')) return;
+      const inBall = document.body.classList.contains('ball');
+      const onArt = !!e.target.closest('#art');
+      drag = { id: e.pointerId, x: e.screenX, y: e.screenY, moved: false, ball: inBall, art: onArt };
+      try {
+        document.documentElement.setPointerCapture(e.pointerId);
+      } catch {
+        /* 捕获失败也能靠窗口内的 move 拖 */
+      }
+      api.dragStart();
+    });
+    document.addEventListener('pointermove', (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      const dx = e.screenX - drag.x;
+      const dy = e.screenY - drag.y;
+      if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+      if (drag.moved) api.dragMove(dx, dy);
+    });
+    document.addEventListener('pointerup', endDrag);
+    document.addEventListener('pointercancel', endDrag);
   }
 
   tick();

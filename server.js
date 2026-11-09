@@ -45,6 +45,13 @@ const LIBRARY_FILE = path.join(DATA_DIR, 'library.json');
 const FAV_DIR = path.join(DATA_DIR, 'fav');
 // 封面图缓存：B 站图床在公网，每次回源都要多等几百毫秒
 const IMG_DIR = path.join(DATA_DIR, 'img');
+// 单独导入的合集快照，和收藏夹缓存分开存
+const SEASON_DIR = path.join(DATA_DIR, 'season');
+// 每个视频的音频码率（要查 playurl 才拿得到，查过就落盘，别反复问 B 站）
+const META_DIR = path.join(DATA_DIR, 'meta');
+// 播放过的音频整文件落盘，第二次播放不再走 B 站，省流量
+const AUDIO_DIR = path.join(DATA_DIR, 'audio');
+const AUDIO_MAX_BYTES = 3 * 1024 * 1024 * 1024; // 缓存上限 3GB，超了按最旧清
 const IMG_MAX_AGE = 'public, max-age=604800'; // 浏览器侧也缓存一周
 
 const UA =
@@ -62,9 +69,46 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /* B 站接口封装                                                         */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 部分接口（如合集列表 seasons_archives_list）没有 buvid Cookie 时
+ * 会直接返回 -352 风控，即使请求来自浏览器同款 UA。
+ * 这里在服务端自己领一对 buvid 并缓存，后续所有接口请求都带上。
+ */
+const BUVID_TTL = 12 * 60 * 60 * 1000;
+let buvidCache = null;
+let buvidPromise = null;
+
+function getBuvid() {
+  if (buvidCache && Date.now() - buvidCache.ts < BUVID_TTL) return Promise.resolve(buvidCache);
+  if (buvidPromise) return buvidPromise;
+  buvidPromise = (async () => {
+    try {
+      const res = await fetch('https://api.bilibili.com/x/frontend/finger/spi', {
+        headers: BASE_HEADERS,
+        signal: AbortSignal.timeout(10000),
+      });
+      const j = await res.json();
+      const b3 = j && j.data && j.data.b_3;
+      const b4 = j && j.data && j.data.b_4;
+      if (b3 && b4) return (buvidCache = { b3, b4, ts: Date.now() });
+    } catch {
+      /* 领不到就退化成不带 Cookie，接口自己会报错 */
+    } finally {
+      buvidPromise = null;
+    }
+    return null;
+  })();
+  return buvidPromise;
+}
+
 async function biliJson(url, extraHeaders) {
+  const headers = { ...BASE_HEADERS, ...(extraHeaders || {}) };
+  if (!headers.Cookie) {
+    const bv = await getBuvid();
+    if (bv) headers.Cookie = `buvid3=${bv.b3}; buvid4=${bv.b4}`;
+  }
   const res = await fetch(url, {
-    headers: { ...BASE_HEADERS, ...(extraHeaders || {}) },
+    headers,
     signal: AbortSignal.timeout(15000),
   });
   const text = await res.text();
@@ -82,12 +126,14 @@ async function favPage(mediaId, pn, ps = 20) {
   const url =
     `https://api.bilibili.com/x/v3/fav/resource/list?media_id=${encodeURIComponent(mediaId)}` +
     `&pn=${pn}&ps=${ps}&platform=web&keyword=&order=mtime&type=0&tid=0`;
-  return biliJson(url);
+  // 登录后带上 Cookie：私密收藏夹也能读
+  return biliJson(url, await authHeaders());
 }
 
 function normalizeMedia(m) {
+  const type = Number(m.type) || 2;
   const dead = !m.title || m.title === '已失效视频' || m.title === '已失效' || m.attr === 9;
-  return {
+  const track = {
     avid: m.id,
     bvid: m.bvid || m.bv_id || '',
     title: m.title || '（已失效）',
@@ -100,6 +146,159 @@ function normalizeMedia(m) {
     favTime: m.fav_time || 0,
     dead,
   };
+  // type 21 是「收藏的整个合集」，本身没有 bvid，展开成单集后才能播
+  if (type === 21) {
+    track.seasonId = String(m.id);
+    track.seasonTitle = m.title || '合集';
+  }
+  return track;
+}
+
+/** 合集展开：type 21 的收藏条目只有合集 id，需要按 mid + season_id 拉出全部单集 */
+const SEASON_PAGE_SIZE = 30;
+const SEASON_MAX_PAGES = 40;
+
+function normalizeSeasonArchive(a, ctx) {
+  const title = a.title || '';
+  return {
+    avid: a.aid,
+    bvid: a.bvid || '',
+    title: title || '（已失效）',
+    cover: a.pic || '',
+    duration: Number(a.duration) || 0,
+    upper: ctx.upper || '',
+    upperMid: ctx.mid || 0,
+    intro: a.desc || '',
+    play: (a.stat && a.stat.view) || 0,
+    favTime: 0,
+    dead: !a.bvid || !title,
+    seasonId: String(ctx.seasonId),
+    seasonTitle: ctx.seasonTitle || '',
+    seasonCover: ctx.seasonCover || '',
+  };
+}
+
+async function seasonData(ctx) {
+  const tracks = [];
+  let meta = null;
+
+  for (let pn = 1; pn <= SEASON_MAX_PAGES; pn += 1) {
+    const j = await biliJson(
+      `https://api.bilibili.com/x/polymer/web-space/seasons_archives_list?mid=${encodeURIComponent(
+        ctx.mid
+      )}&season_id=${encodeURIComponent(ctx.seasonId)}&page_num=${pn}&page_size=${SEASON_PAGE_SIZE}`
+    );
+    if (j.code !== 0) {
+      const err = new Error(j.message || `合集读取失败 ${j.code}`);
+      err.code = j.code;
+      throw err;
+    }
+
+    const data = j.data || {};
+    if (pn === 1) meta = data.meta || null;
+    const archives = data.archives || [];
+    const resolved = {
+      mid: ctx.mid,
+      seasonId: ctx.seasonId,
+      seasonTitle: (meta && (meta.title || meta.name)) || ctx.seasonTitle || `合集 ${ctx.seasonId}`,
+      seasonCover: (meta && meta.cover) || ctx.seasonCover || '',
+      upper: ctx.upper || '',
+    };
+    for (const a of archives) tracks.push(normalizeSeasonArchive(a, resolved));
+
+    const total = (data.page && data.page.total) || (meta && meta.total) || 0;
+    if (!archives.length || (total && tracks.length >= total) || archives.length < SEASON_PAGE_SIZE) break;
+    await sleep(220);
+  }
+
+  // card 接口在部分网络下会被风控，退一步用任意一集的 view 拿 UP 昵称
+  if (!ctx.upper) {
+    const first = tracks.find((t) => t.bvid);
+    const name = first ? await fetchOwnerName(first.bvid) : '';
+    if (name) {
+      ctx.upper = name;
+      for (const t of tracks) if (!t.upper) t.upper = name;
+    }
+  }
+
+  return {
+    info: {
+      id: String(ctx.seasonId),
+      mid: String(ctx.mid),
+      title: (meta && (meta.title || meta.name)) || ctx.seasonTitle || `合集 ${ctx.seasonId}`,
+      cover: (meta && meta.cover) || ctx.seasonCover || '',
+      upper: ctx.upper || '',
+      count: (meta && meta.total) || tracks.length,
+      description: (meta && meta.description) || '',
+    },
+    tracks,
+  };
+}
+
+/** 合集 meta 里没有 UP 昵称，单独查一次（失败不影响导入） */
+async function fetchUpperName(mid) {
+  try {
+    const j = await biliJson(`https://api.bilibili.com/x/web-interface/card?mid=${encodeURIComponent(mid)}`);
+    return (j.data && j.data.card && j.data.card.name) || '';
+  } catch {
+    return '';
+  }
+}
+
+/** card 被风控时，改用任意一集的 view 拿 UP 昵称 */
+async function fetchOwnerName(bvid) {
+  try {
+    const j = await biliJson(`https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(bvid)}`);
+    return (j.data && j.data.owner && j.data.owner.name) || '';
+  } catch {
+    return '';
+  }
+}
+
+/** 把 type 21 占位条目替换成它包含的单集；普通视频优先，重复 bvid 只留一条 */
+async function expandSeasonTracks(tracks) {
+  const plain = new Set(tracks.filter((t) => !t.seasonId && t.bvid).map((t) => t.bvid));
+  const added = new Set();
+  const out = [];
+
+  for (const t of tracks) {
+    if (!t.seasonId) {
+      if (!t.bvid || !added.has(t.bvid)) {
+        if (t.bvid) added.add(t.bvid);
+        out.push(t);
+      }
+      continue;
+    }
+
+    if (!t.upperMid) {
+      out.push({ ...t, dead: true, title: `${t.seasonTitle}（合集，缺少 UP 信息）` });
+      continue;
+    }
+
+    try {
+      const { tracks: eps } = await seasonData({
+        mid: t.upperMid,
+        seasonId: t.seasonId,
+        seasonTitle: t.seasonTitle,
+        seasonCover: t.cover,
+        upper: t.upper,
+      });
+      if (!eps.length) {
+        out.push({ ...t, dead: true, title: `${t.seasonTitle}（合集为空）` });
+        continue;
+      }
+      for (const ep of eps) {
+        if (!ep.bvid || plain.has(ep.bvid) || added.has(ep.bvid)) continue;
+        added.add(ep.bvid);
+        out.push(ep);
+      }
+    } catch (e) {
+      console.error(`[fav] 合集 ${t.seasonId} 展开失败:`, e.message);
+      out.push({ ...t, dead: true, title: `${t.seasonTitle}（合集，展开失败）` });
+    }
+  }
+
+  return out;
 }
 
 /** 收藏夹全量（自动翻页） */
@@ -139,8 +338,148 @@ async function favAll(mediaId, onProgress) {
           cover: info.cover || '',
         }
       : null,
+    tracks: await expandSeasonTracks(tracks),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* B 站搜索                                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 搜索结果标题里带 <em class="keyword">高亮标签</em>，
+ * 得先去掉标签再把 HTML 实体还原，否则列表里会显示成一堆尖括号。
+ */
+function stripSearchText(s) {
+  return String(s || '')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&') // &amp; 放最后，避免把上面还原出来的再解一次
+    .trim();
+}
+
+/** 搜索结果的时长是 "5:50" / "1:02:03" 这种文本，转成秒 */
+function parseDurationText(s) {
+  const parts = String(s || '')
+    .split(':')
+    .map((x) => Number(x));
+  if (!parts.length || parts.some((n) => !Number.isFinite(n))) return 0;
+  return parts.reduce((acc, n) => acc * 60 + n, 0);
+}
+
+// 同一关键词 5 分钟内直接复用，连续回车/刷新不会反复打 B 站接口
+const SEARCH_TTL = 5 * 60 * 1000;
+const SEARCH_CACHE_MAX = 60;
+const searchCache = new Map(); // `${keyword}#${page}` -> { ts, data }
+
+/** 视频搜索（第一页 20 条），返回和收藏夹曲目同构的 tracks */
+async function searchVideos(keyword, page = 1) {
+  const key = `${keyword}#${page}`;
+  const hit = searchCache.get(key);
+  if (hit && Date.now() - hit.ts < SEARCH_TTL) return hit.data;
+
+  const url =
+    'https://api.bilibili.com/x/web-interface/search/type?search_type=video' +
+    `&keyword=${encodeURIComponent(keyword)}&page=${page}&page_size=20&order=totalrank`;
+  const j = await biliJson(url);
+  if (j.code !== 0) {
+    const err = new Error(j.message || `搜索失败 ${j.code}`);
+    err.code = j.code;
+    throw err;
+  }
+
+  const d = j.data || {};
+  const tracks = [];
+  for (const it of d.result || []) {
+    if (!it || !it.bvid) continue;
+    if (it.type && it.type !== 'video') continue; // 混进来的番剧/课程条目播不了
+    tracks.push({
+      avid: it.aid,
+      bvid: it.bvid,
+      title: stripSearchText(it.title) || '（无标题）',
+      cover: it.pic || '',
+      duration: parseDurationText(it.duration),
+      upper: stripSearchText(it.author),
+      upperMid: it.mid || 0,
+      intro: stripSearchText(it.description),
+      play: Number(it.play) || 0,
+      pubdate: Number(it.pubdate) || 0,
+      favTime: 0,
+      dead: false,
+      fromSearch: true,
+    });
+  }
+
+  const data = {
+    keyword,
+    page: Number(d.page) || page,
+    pageSize: Number(d.pagesize) || 20,
+    total: Number(d.numResults) || 0,
+    pages: Number(d.numPages) || 0,
     tracks,
   };
+
+  searchCache.set(key, { ts: Date.now(), data });
+  if (searchCache.size > SEARCH_CACHE_MAX) {
+    searchCache.delete(searchCache.keys().next().value); // 超量丢最早的一条
+  }
+  return data;
+}
+
+/* ------------------------------------------------------------------ */
+/* 视频所属的合集（搜索结果里要用）                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * B 站搜索接口不告诉你「这条视频属于哪个合集」，只有 x/web-interface/view 里带 ugc_season。
+ * 所以搜索完在后台逐条补一下：限速 + 内存缓存，查不到就当它没有合集。
+ */
+const SEASON_OF_TTL = 30 * 60 * 1000;
+const seasonOfCache = new Map(); // bvid -> { ts, data }，data = null 表示确实不在合集里
+
+async function seasonOfBvid(bvid) {
+  const hit = seasonOfCache.get(bvid);
+  if (hit && Date.now() - hit.ts < SEASON_OF_TTL) return hit.data;
+
+  let data = null;
+  try {
+    const j = await biliJson(
+      `https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(bvid)}`,
+      await authHeaders()
+    );
+    const s = j && j.data && j.data.ugc_season;
+    if (s && s.id) {
+      data = {
+        seasonId: String(s.id),
+        title: s.title || '',
+        mid: String(s.mid || ''),
+        cover: s.cover || '',
+      };
+    }
+  } catch {
+    return undefined; // 网络 / 风控失败：不写缓存，下次还能再试
+  }
+
+  seasonOfCache.set(bvid, { ts: Date.now(), data });
+  if (seasonOfCache.size > 600) seasonOfCache.delete(seasonOfCache.keys().next().value);
+  return data;
+}
+
+/** 批量查（最多 20 条），条与条之间留点间隔，别把风控惹毛 */
+async function seasonsOfMany(bvids) {
+  const map = {};
+  let first = true;
+  for (const bvid of bvids) {
+    if (!first) await sleep(160);
+    first = false;
+    const r = await seasonOfBvid(bvid);
+    if (r === undefined) continue; // 查失败的不写进结果，前端下次还会再问
+    map[bvid] = r;
+  }
+  return map;
 }
 
 /** bvid -> cid（顺带拿分 P 信息） */
@@ -209,6 +548,81 @@ async function getCachedSource(bvid, cid, force = false) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 音频码率（列表里显示「音质」用）                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 码率只有 playurl 里有（dash.audio[].bandwidth），得先拿 cid 再查一次。
+ * 一个视频两次请求，所以：查过就落盘（data/meta/<bvid>.json），7 天内直接读盘。
+ */
+const META_TTL = 7 * 24 * 60 * 60 * 1000;
+
+function metaFile(bvid) {
+  return path.join(META_DIR, `${bvid}.json`);
+}
+
+function readMeta(bvid) {
+  try {
+    const j = JSON.parse(fs.readFileSync(metaFile(bvid), 'utf8'));
+    if (j && typeof j.bandwidth === 'number' && Date.now() - (j.ts || 0) < META_TTL) return j;
+  } catch {
+    /* 没缓存 */
+  }
+  return null;
+}
+
+function writeMeta(bvid, data) {
+  try {
+    fs.mkdirSync(META_DIR, { recursive: true });
+    const file = metaFile(bvid);
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ ...data, ts: Date.now() }), 'utf8');
+    fs.renameSync(tmp, file);
+  } catch {
+    /* 写不进去不影响这次返回 */
+  }
+}
+
+async function bitrateOf(bvid) {
+  const hit = readMeta(bvid);
+  if (hit) return { bandwidth: hit.bandwidth, quality: hit.quality || 0, estimated: !!hit.estimated, cached: true };
+
+  const info = await resolveCid(bvid); // 顺带拿 cid
+  let src;
+  try {
+    src = await audioSource(bvid, info.cid);
+  } catch (e) {
+    throw e;
+  }
+  const data = { bandwidth: src.bandwidth || 0, quality: src.quality || 0, mime: src.mime || '' };
+
+  // 老视频可能只有 durl（flv/mp4 混流，音视频合在一起）：
+  // 用「分段总字节数 × 8 ÷ 时长」估算一个总码率，标记 estimated，前端显示 ≈
+  if (!data.bandwidth) {
+    try {
+      const j = await biliJson(
+        `https://api.bilibili.com/x/player/playurl?bvid=${encodeURIComponent(bvid)}&cid=${info.cid}&fnval=16&fnver=0&fourk=1`,
+        await authHeaders()
+      );
+      const durl = j && j.data && j.data.durl;
+      const tl = j && j.data && j.data.timelength;
+      if (Array.isArray(durl) && durl.length && tl > 0) {
+        const bytes = durl.reduce((a, x) => a + Number(x.size || 0), 0);
+        if (bytes > 0) {
+          data.bandwidth = Math.round((bytes * 8) / (tl / 1000));
+          data.estimated = true; // 混流里含视频流，只能算个大概
+        }
+      }
+    } catch {
+      /* 估算失败就按 0 算 */
+    }
+  }
+
+  writeMeta(bvid, data);
+  return data;
+}
+
+/* ------------------------------------------------------------------ */
 /* 工具                                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -247,8 +661,88 @@ function isAllowedImageHost(hostname) {
 /* 音频代理                                                             */
 /* ------------------------------------------------------------------ */
 
+/* ---------------- 音频磁盘缓存 ---------------- */
+
+const audioCache = new Map(); // bvid -> { total, hit } 防并发下载同一首
+
+function audioCacheFile(bvid) {
+  return path.join(AUDIO_DIR, bvid + '.m4a');
+}
+
+function audioCacheComplete(bvid) {
+  try {
+    const st = fs.statSync(audioCacheFile(bvid));
+    return st.size > 0 ? st : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 超上限时按 mtime 最旧优先清理（正在下载的不动） */
+function pruneAudioCache() {
+  let files;
+  try {
+    files = fs.readdirSync(AUDIO_DIR).filter((f) => f.endsWith('.m4a'));
+  } catch {
+    return;
+  }
+  let total = 0;
+  const items = [];
+  for (const f of files) {
+    try {
+      const st = fs.statSync(path.join(AUDIO_DIR, f));
+      total += st.size;
+      items.push({ f, path: path.join(AUDIO_DIR, f), size: st.size, mtime: st.mtimeMs });
+    } catch {}
+  }
+  if (total <= AUDIO_MAX_BYTES) return;
+  items.sort((a, b) => a.mtime - b.mtime);
+  for (const it of items) {
+    if (total <= AUDIO_MAX_BYTES) break;
+    if (audioCache.has(it.f.replace('.m4a', ''))) continue; // 正在下载的不清
+    try {
+      fs.unlinkSync(it.path);
+      total -= it.size;
+    } catch {}
+  }
+}
+
 async function proxyAudio(req, res, bvid, cid) {
   if (!bvid) return sendText(res, 400, 'missing bvid');
+
+  /* 完整缓存命中：本地直接伺服，支持 Range 拖进度条 */
+  const cached = audioCacheComplete(bvid);
+  if (cached) {
+    const buf = fs.readFileSync(audioCacheFile(bvid));
+    const total = buf.length;
+    const range = req.headers.range;
+    if (range) {
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      let start = m && m[1] ? parseInt(m[1], 10) : 0;
+      let end = m && m[2] ? parseInt(m[2], 10) : total - 1;
+      if (isNaN(start) || start < 0) start = 0;
+      if (isNaN(end) || end >= total) end = total - 1;
+      if (start > end || start >= total) {
+        res.writeHead(416, { 'Content-Range': `bytes */${total}` });
+        return res.end();
+      }
+      res.writeHead(206, {
+        'Content-Type': 'audio/mp4',
+        'Accept-Ranges': 'bytes',
+        'Content-Range': `bytes ${start}-${end}/${total}`,
+        'Content-Length': end - start + 1,
+        'Cache-Control': 'no-store',
+      });
+      return res.end(buf.subarray(start, end + 1));
+    }
+    res.writeHead(200, {
+      'Content-Type': 'audio/mp4',
+      'Accept-Ranges': 'bytes',
+      'Content-Length': total,
+      'Cache-Control': 'no-store',
+    });
+    return res.end(buf);
+  }
 
   let src;
   try {
@@ -297,6 +791,24 @@ async function proxyAudio(req, res, bvid, cid) {
     return sendText(res, up.status, 'B站拒绝: ' + up.status);
   }
 
+  /* 从头开始的整文件请求才落盘（下载完转正）；
+     浏览器 <audio> 通常发 Range: bytes=0-，也算整文件；
+     中途拖进度条（start>0 或带 end）的不缓存半截 */
+  const m0 = range ? /bytes=(\d+)-(\d*)/.exec(range) : null;
+  const isFullRequest = !range || (m0 && m0[1] === '0' && !m0[2]);
+  let cacheStream = null;
+  const canCache = isFullRequest && (up.status === 200 || up.status === 206) && (src.mime || '').includes('mp4');
+  if (canCache) {
+    try {
+      fs.mkdirSync(AUDIO_DIR, { recursive: true });
+      const tmp = audioCacheFile(bvid) + '.part';
+      cacheStream = fs.createWriteStream(tmp);
+      audioCache.set(bvid, { ts: Date.now() });
+    } catch {
+      cacheStream = null; // 磁盘满/只读等，退化为纯转发
+    }
+  }
+
   const headers = {
     'Content-Type': src.mime || 'audio/mp4',
     'Accept-Ranges': 'bytes',
@@ -309,11 +821,41 @@ async function proxyAudio(req, res, bvid, cid) {
 
   res.writeHead(up.status, headers);
 
-  if (!up.body) return res.end();
+  if (!up.body) {
+    if (cacheStream) cacheStream.end();
+    return res.end();
+  }
   const nodeStream = Readable.fromWeb(up.body);
-  nodeStream.on('error', () => res.destroy());
-  req.on('close', () => nodeStream.destroy());
-  nodeStream.pipe(res);
+  nodeStream.on('error', () => {
+    if (cacheStream) cacheStream.destroy();
+    res.destroy();
+  });
+  req.on('close', () => {
+    nodeStream.destroy();
+    // 没下完就断开：删掉半截文件，别留垃圾
+    if (cacheStream && !nodeStream.readableEnded) {
+      audioCache.delete(bvid);
+      try { fs.unlinkSync(audioCacheFile(bvid) + '.part'); } catch {}
+    }
+  });
+
+  if (cacheStream) {
+    const tmp = audioCacheFile(bvid) + '.part';
+    cacheStream.on('error', () => {
+      try { fs.unlinkSync(tmp); } catch {}
+    });
+    cacheStream.on('finish', () => {
+      try {
+        fs.renameSync(tmp, audioCacheFile(bvid));
+        audioCache.delete(bvid);
+        pruneAudioCache();
+      } catch {}
+    });
+    nodeStream.pipe(cacheStream);
+    nodeStream.pipe(res);
+  } else {
+    nodeStream.pipe(res);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -395,7 +937,8 @@ async function listPublicFolders(mid) {
   let pn = 1;
   while (pn <= 5) {
     const j = await biliJson(
-      `https://api.bilibili.com/x/v3/fav/folder/created/list?up_mid=${encodeURIComponent(mid)}&pn=${pn}&ps=50`
+      `https://api.bilibili.com/x/v3/fav/folder/created/list?up_mid=${encodeURIComponent(mid)}&pn=${pn}&ps=50`,
+      await authHeaders()
     );
     if (j.code !== 0) {
       const err = new Error(j.message || `错误码 ${j.code}`);
@@ -420,6 +963,324 @@ async function listPublicFolders(mid) {
     await sleep(200);
   }
   return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* B 站登录（扫码）与「添加到自己的收藏夹」                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 登录态只存在服务端 data/auth.json（0600），前端永远拿不到 Cookie，
+ * 只会拿到 uname / face / mid。退出登录就是删这个文件。
+ * 没登录时所有请求行为和以前完全一样（匿名 + buvid）。
+ */
+const AUTH_FILE = path.join(DATA_DIR, 'auth.json');
+let authCache = null;
+
+function readAuth() {
+  if (authCache) return authCache;
+  try {
+    const j = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
+    authCache = j && j.sessdata && j.biliJct ? j : null;
+  } catch {
+    authCache = null;
+  }
+  return authCache;
+}
+
+function writeAuth(data) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = `${AUTH_FILE}.${process.pid}.tmp`;
+  // 权限 600：这是账号凭证，同机器其他用户不该能读
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tmp, AUTH_FILE);
+  try {
+    fs.chmodSync(AUTH_FILE, 0o600);
+  } catch {
+    /* Windows 上 chmod 基本是空操作，忽略 */
+  }
+  authCache = data;
+}
+
+function clearAuth() {
+  authCache = null;
+  try {
+    fs.unlinkSync(AUTH_FILE);
+  } catch {
+    /* 本来就没有 */
+  }
+}
+
+function cookieOf(a) {
+  return `SESSDATA=${a.sessdata}; bili_jct=${a.biliJct}; DedeUserID=${a.mid}`;
+}
+
+/** 登录后给 B 站接口用的请求头；没登录返回 null（等于匿名） */
+async function authHeaders() {
+  const a = readAuth();
+  if (!a) return null;
+  const bv = await getBuvid();
+  const parts = [cookieOf(a)];
+  if (bv) parts.push(`buvid3=${bv.b3}`, `buvid4=${bv.b4}`);
+  return { Cookie: parts.join('; ') };
+}
+
+/**
+ * 用某个 Cookie 查登录信息。
+ * 返回 { user } | { invalid: true } | { error: true }：
+ *  - invalid：B 站明确说没登录（-101 / isLogin=false）→ Cookie 真的废了，可以清
+ *  - error  ：网络不通 / 风控 / 5xx 之类的临时问题 → **绝不能当成没登录**，
+ *             否则一次网络抖动就会把用户辛苦扫的登录态删掉
+ */
+async function navInfo(cookie) {
+  try {
+    const bv = await getBuvid();
+    const parts = [cookie];
+    if (bv) parts.push(`buvid3=${bv.b3}`, `buvid4=${bv.b4}`);
+    const j = await biliJson('https://api.bilibili.com/x/web-interface/nav', { Cookie: parts.join('; ') });
+    if (!j || typeof j.code !== 'number') return { error: true };
+    if (j.code === -101 || j.code === -400) return { invalid: true };
+    if (j.code !== 0) return { error: true };
+    if (!j.data || !j.data.isLogin) return { invalid: true };
+    return {
+      user: {
+        mid: String(j.data.mid),
+        uname: j.data.uname || '',
+        face: j.data.face || '',
+        vip: !!(j.data.vipStatus),
+      },
+    };
+  } catch {
+    return { error: true };
+  }
+}
+
+/**
+ * 当前登录用户。
+ * 登录态以 data/auth.json 为准（落盘，重启/部署都不会丢）；
+ * 只有 B 站明确说失效才删文件，网络问题就沿用本地保存的信息。
+ */
+async function currentUser() {
+  const a = readAuth();
+  if (!a) return null;
+
+  const r = await navInfo(cookieOf(a));
+  if (r.invalid) {
+    console.warn('[auth] B 站说登录态已失效，清掉本地 Cookie');
+    clearAuth();
+    return null;
+  }
+  if (r.error) {
+    // 临时故障：继续用本地记录，别把用户踢下线
+    return { mid: a.mid, uname: a.uname || '', face: a.face || '', vip: false, offline: true };
+  }
+
+  const u = r.user;
+  // 昵称/头像可能改过，顺手把本地那份也更新掉
+  if (u.mid !== a.mid || u.uname !== a.uname || u.face !== a.face) {
+    writeAuth({ ...a, mid: u.mid, uname: u.uname, face: u.face, savedAt: a.savedAt || new Date().toISOString() });
+  }
+  return u;
+}
+
+/* ---- 扫码登录 ---- */
+
+// 二维码有效期 180s，这里留点余量；只用来避免内存里堆无用的 key
+const QR_TTL = 5 * 60 * 1000;
+const qrKeys = new Map(); // qrcode_key -> 生成时间
+
+async function qrGenerate() {
+  const j = await biliJson('https://passport.bilibili.com/x/passport-login/web/qrcode/generate');
+  if (j.code !== 0 || !j.data || !j.data.qrcode_key) {
+    throw new Error(j.message || `二维码生成失败 ${j.code}`);
+  }
+  qrKeys.set(j.data.qrcode_key, Date.now());
+  for (const [k, ts] of qrKeys) if (Date.now() - ts > QR_TTL) qrKeys.delete(k);
+  return { key: j.data.qrcode_key, url: j.data.url };
+}
+
+/** 轮询扫码结果；成功后落盘 Cookie */
+async function qrPoll(key) {
+  const bv = await getBuvid();
+  const headers = { ...BASE_HEADERS };
+  if (bv) headers.Cookie = `buvid3=${bv.b3}; buvid4=${bv.b4}`;
+
+  const res = await fetch(
+    `https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=${encodeURIComponent(key)}`,
+    { headers, signal: AbortSignal.timeout(15000) }
+  );
+  const j = await res.json();
+  const d = (j && j.data) || {};
+  const code = Number(d.code);
+
+  if (code === 86101) return { status: 'waiting', message: '等待扫码' };
+  if (code === 86090) return { status: 'scanned', message: '已扫码，请在手机上点确认' };
+  if (code === 86038) return { status: 'expired', message: '二维码已过期，请刷新' };
+  if (code !== 0) return { status: 'error', message: d.message || `登录失败 ${code}` };
+
+  // 成功后 Cookie 在 data.url 的查询串里；个别情况下只在 Set-Cookie 里
+  let sessdata = '';
+  let biliJct = '';
+  let mid = '';
+  try {
+    const u = new URL(d.url);
+    sessdata = u.searchParams.get('SESSDATA') || '';
+    biliJct = u.searchParams.get('bili_jct') || '';
+    mid = u.searchParams.get('DedeUserID') || '';
+  } catch {
+    /* url 解析失败就退回 Set-Cookie */
+  }
+  if (!sessdata) {
+    const raw = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+    for (const line of raw) {
+      const m = String(line).match(/^([^=]+)=([^;]*)/);
+      if (!m) continue;
+      if (m[1] === 'SESSDATA') sessdata = decodeURIComponent(m[2]);
+      else if (m[1] === 'bili_jct') biliJct = m[2];
+      else if (m[1] === 'DedeUserID') mid = m[2];
+    }
+  }
+  if (!sessdata || !biliJct) {
+    return { status: 'error', message: '登录成功但没拿到 Cookie，请重新登录' };
+  }
+
+  const r = await navInfo(cookieOf({ sessdata, biliJct, mid }));
+  if (r.invalid) return { status: 'error', message: 'Cookie 校验没通过，请重新登录' };
+
+  // 网络抽风时（r.error）也已经拿到有效 Cookie：先落盘，昵称头像下次 /api/login/me 再补
+  const u = r.user || { mid: mid || '', uname: '', face: '' };
+  const saved = {
+    sessdata,
+    biliJct,
+    mid: u.mid || mid,
+    uname: u.uname || '',
+    face: u.face || '',
+    savedAt: new Date().toISOString(),
+  };
+  writeAuth(saved);
+  qrKeys.delete(key);
+  return {
+    status: 'success',
+    message: '登录成功',
+    user: { mid: saved.mid, uname: saved.uname, face: saved.face },
+  };
+}
+
+/* ---- 我自己的收藏夹（只列自己创建的，不含订阅别人的） ---- */
+
+async function myFavFolders() {
+  const a = readAuth();
+  if (!a) {
+    const err = new Error('需要先登录 B 站');
+    err.code = -101;
+    throw err;
+  }
+  const j = await biliJson(
+    `https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=${encodeURIComponent(a.mid)}`,
+    await authHeaders()
+  );
+  if (j.code !== 0) {
+    const err = new Error(j.code === -101 ? '登录已失效，请重新登录' : j.message || `错误码 ${j.code}`);
+    err.code = j.code;
+    throw err;
+  }
+  const list = (j.data && j.data.list) || [];
+  return list.map((f) => ({
+    id: String(f.id),
+    title: f.title || '未命名收藏夹',
+    count: Number(f.media_count) || 0,
+    cover: f.cover || '',
+    isPrivate: !!(f.attr & 1),
+  }));
+}
+
+/** 把任意公开视频收藏进「我自己的」收藏夹；带 fromFolderId 时是从另一个夹子移过来 */
+async function addToMyFav(bvid, avid, folderId, fromFolderId) {
+  const a = readAuth();
+  if (!a) {
+    const err = new Error('需要先登录 B 站');
+    err.code = -101;
+    throw err;
+  }
+
+  let aid = Number(avid) || 0;
+  if (!aid) {
+    const j = await biliJson(`https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(bvid)}`);
+    aid = Number(j && j.data && j.data.aid) || 0;
+  }
+  if (!aid) throw new Error('拿不到这个视频的 aid');
+
+  const body = new URLSearchParams({
+    rid: String(aid),
+    type: '2', // 2 = 视频稿件
+    add_media_ids: String(folderId),
+    del_media_ids: fromFolderId ? String(fromFolderId) : '', // 一起传就是「移动」
+    csrf: a.biliJct, // 就是 bili_jct，缺了会 -111
+  });
+
+  const res = await fetch('https://api.bilibili.com/x/v3/fav/resource/deal', {
+    method: 'POST',
+    headers: {
+      ...BASE_HEADERS,
+      ...(await authHeaders()),
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Origin: 'https://www.bilibili.com',
+    },
+    body,
+    signal: AbortSignal.timeout(15000),
+  });
+  const j = await res.json();
+  if (j.code !== 0) {
+    const err = new Error(j.message || `收藏失败 ${j.code}`);
+    err.code = j.code;
+    throw err;
+  }
+  // 注意：data.success_num 在 B 站这边**永远是 0**（加成功了也是 0），
+  // 不能拿它判断成败，code === 0 就是成功。
+  console.log(
+    `[fav] ${fromFolderId ? '移动' : '收藏'} ${bvid} -> ${folderId}` +
+      (fromFolderId ? `（从 ${fromFolderId}）` : '') +
+      ` code=0`
+  );
+  return j.data || {};
+}
+
+/** 给当前登录账号新建一个收藏夹（B 站 x/v3/fav/folder/add） */
+async function createMyFavFolder(title, privacy) {
+  const a = readAuth();
+  if (!a) {
+    const err = new Error('需要先登录 B 站');
+    err.code = -101;
+    throw err;
+  }
+
+  const body = new URLSearchParams({
+    title,
+    introduction: '',
+    privacy: privacy ? '1' : '0', // 0 公开 / 1 私密
+    cover: '',
+    csrf: a.biliJct,
+  });
+
+  const res = await fetch('https://api.bilibili.com/x/v3/fav/folder/add', {
+    method: 'POST',
+    headers: {
+      ...BASE_HEADERS,
+      ...(await authHeaders()),
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Origin: 'https://www.bilibili.com',
+    },
+    body,
+    signal: AbortSignal.timeout(15000),
+  });
+  const j = await res.json();
+  if (j.code !== 0) {
+    const err = new Error(j.message || `新建收藏夹失败 ${j.code}`);
+    err.code = j.code;
+    throw err;
+  }
+  const d = j.data || {};
+  return { id: String(d.id || ''), title: d.title || title, privacy: !!privacy };
 }
 
 /* ------------------------------------------------------------------ */
@@ -472,6 +1333,53 @@ function pruneFavCache(keepIds) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 单独导入的合集快照                                                    */
+/* ------------------------------------------------------------------ */
+
+function seasonCacheKey(mediaId) {
+  const m = String(mediaId || '').match(/^season:(\d+):(\d+)$/);
+  return m ? `${m[1]}_${m[2]}` : null;
+}
+
+function seasonCacheFile(mid, seasonId) {
+  return path.join(SEASON_DIR, `${mid}_${seasonId}.json`);
+}
+
+function readSeasonCache(mid, seasonId) {
+  try {
+    const j = JSON.parse(fs.readFileSync(seasonCacheFile(mid, seasonId), 'utf8'));
+    if (!j || !Array.isArray(j.tracks)) return null;
+    return j;
+  } catch {
+    return null;
+  }
+}
+
+function writeSeasonCache(mid, seasonId, data) {
+  try {
+    fs.mkdirSync(SEASON_DIR, { recursive: true });
+    const file = seasonCacheFile(mid, seasonId);
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ savedAt: new Date().toISOString(), ...data }), 'utf8');
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    console.error('[season] 缓存写入失败:', e.message);
+  }
+}
+
+function pruneSeasonCache(keepKeys) {
+  try {
+    const keep = new Set(keepKeys);
+    for (const name of fs.readdirSync(SEASON_DIR)) {
+      if (!name.endsWith('.json')) continue;
+      if (!keep.has(name.slice(0, -5))) fs.unlinkSync(path.join(SEASON_DIR, name));
+    }
+  } catch {
+    /* 目录还不存在 */
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* 收藏夹列表持久化（服务端文件）                                        */
 /* ------------------------------------------------------------------ */
 
@@ -507,7 +1415,8 @@ function sanitizeLibrary(input) {
       cover: String((f && f.cover) || ''),
       upper: String((f && f.upper) || ''),
     }))
-    .filter((f) => /^\d+$/.test(f.mediaId));
+    // 普通收藏夹是纯数字；单独导入的合集用 season:<mid>:<season_id> 作为唯一键
+    .filter((f) => /^\d+$/.test(f.mediaId) || /^season:\d+:\d+$/.test(f.mediaId));
 
   // 去重（同一个收藏夹只留一条）
   const seen = new Set();
@@ -757,6 +1666,7 @@ const server = http.createServer(async (req, res) => {
         const clean = sanitizeLibrary(input);
         writeLibrary(clean);
         pruneFavCache(clean.folders.map((f) => f.mediaId));
+        pruneSeasonCache(clean.folders.map((f) => seasonCacheKey(f.mediaId)).filter(Boolean));
         return sendJson(res, 200, { ok: true, current: clean.current, count: clean.folders.length });
       }
       return sendJson(res, 405, { ok: false, error: '只支持 GET / POST' });
@@ -867,11 +1777,199 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, ...data, cached: false });
     }
 
+    if (pathname === '/api/season') {
+      const mid = (searchParams.get('mid') || '').trim();
+      const seasonId = (searchParams.get('season_id') || '').trim();
+      if (!/^\d+$/.test(mid) || !/^\d+$/.test(seasonId)) {
+        return sendJson(res, 400, { ok: false, error: 'mid 和 season_id 应该是纯数字' });
+      }
+
+      const refresh = searchParams.get('refresh') === '1';
+      if (!refresh) {
+        const hit = readSeasonCache(mid, seasonId);
+        if (hit) return sendJson(res, 200, { ok: true, ...hit, cached: true });
+      }
+
+      try {
+        const upper = await fetchUpperName(mid);
+        const data = await seasonData({ mid, seasonId, upper });
+        writeSeasonCache(mid, seasonId, data);
+        return sendJson(res, 200, { ok: true, ...data, cached: false });
+      } catch (e) {
+        // 回源失败时用旧快照顶上，和收藏夹的行为保持一致
+        const hit = readSeasonCache(mid, seasonId);
+        if (hit) {
+          return sendJson(res, 200, { ok: true, ...hit, cached: true, warning: e.message || String(e) });
+        }
+        return sendJson(res, 502, { ok: false, error: e.message || String(e) });
+      }
+    }
+
     if (pathname === '/api/folders') {
       const mid = (searchParams.get('mid') || '').trim();
       if (!/^\d+$/.test(mid)) return sendJson(res, 400, { ok: false, error: 'UID 应该是纯数字' });
       const folders = await listPublicFolders(mid);
       return sendJson(res, 200, { ok: true, folders });
+    }
+
+    if (pathname === '/api/search') {
+      const keyword = (searchParams.get('keyword') || '').trim().slice(0, 80);
+      if (!keyword) return sendJson(res, 400, { ok: false, error: '关键词不能为空' });
+      const page = Math.max(1, Math.min(Number(searchParams.get('page')) || 1, 50));
+      try {
+        const data = await searchVideos(keyword, page);
+        return sendJson(res, 200, { ok: true, ...data });
+      } catch (e) {
+        // 搜索接口最容易撞 -412 风控，给一句人话而不是裸错误码
+        const msg =
+          e.code === -412 || e.code === -352
+            ? `搜索被 B 站风控拦了（${e.code}），过一会儿再试`
+            : e.message || String(e);
+        return sendJson(res, 502, { ok: false, error: msg, code: e.code });
+      }
+    }
+
+    if (pathname === '/api/seasons') {
+      // 搜索结果里「这些视频分别属于哪个合集」，一次最多问 20 条
+      const bvids = (searchParams.get('bvids') || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => /^BV[0-9A-Za-z]{8,12}$/.test(s))
+        .slice(0, 20);
+      if (!bvids.length) return sendJson(res, 400, { ok: false, error: 'bvids 不能为空' });
+      const map = await seasonsOfMany(bvids);
+      return sendJson(res, 200, { ok: true, map });
+    }
+
+    if (pathname === '/api/bitrates') {
+      // 这些视频的音频码率（列表里的「音质」列），一次最多问 10 条
+      const bvids = (searchParams.get('bvids') || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => /^BV[0-9A-Za-z]{8,12}$/.test(s))
+        .slice(0, 10);
+      if (!bvids.length) return sendJson(res, 400, { ok: false, error: 'bvids 不能为空' });
+
+      const map = {};
+      let first = true;
+      for (const bvid of bvids) {
+        if (!first) await sleep(140); // 每条要两次请求，间隔一下
+        first = false;
+        try {
+          map[bvid] = await bitrateOf(bvid);
+        } catch {
+          map[bvid] = null; // 拿不到的（失效/无音频）给 null，前端显示「—」
+        }
+      }
+      return sendJson(res, 200, { ok: true, map });
+    }
+
+    if (pathname === '/api/login/qr') {
+      try {
+        const qr = await qrGenerate();
+        return sendJson(res, 200, { ok: true, ...qr });
+      } catch (e) {
+        return sendJson(res, 502, { ok: false, error: e.message || String(e) });
+      }
+    }
+
+    if (pathname === '/api/login/poll') {
+      const key = (searchParams.get('key') || '').trim();
+      if (!key) return sendJson(res, 400, { ok: false, status: 'error', error: '缺少 key' });
+      try {
+        const r = await qrPoll(key);
+        return sendJson(res, 200, { ok: r.status !== 'error', ...r });
+      } catch (e) {
+        return sendJson(res, 502, { ok: false, status: 'error', error: e.message || String(e) });
+      }
+    }
+
+    if (pathname === '/api/login/me') {
+      const user = await currentUser();
+      return sendJson(res, 200, { ok: true, isLogin: !!user, user });
+    }
+
+    if (pathname === '/api/login/logout') {
+      if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: '只支持 POST' });
+      clearAuth();
+      return sendJson(res, 200, { ok: true });
+    }
+
+    if (pathname === '/api/my/favs') {
+      try {
+        const folders = await myFavFolders();
+        return sendJson(res, 200, { ok: true, folders });
+      } catch (e) {
+        return sendJson(res, e.code === -101 ? 401 : 502, {
+          ok: false,
+          error: e.message || String(e),
+          code: e.code,
+        });
+      }
+    }
+
+    if (pathname === '/api/fav/add') {
+      if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: '只支持 POST' });
+      let d;
+      try {
+        d = JSON.parse((await readBody(req, 8 * 1024)) || '{}');
+      } catch {
+        return sendJson(res, 400, { ok: false, error: '不是合法 JSON' });
+      }
+      const bvid = String(d.bvid || '').trim();
+      const folderId = String(d.folderId || '').trim();
+      const fromFolderId = String(d.fromFolderId || '').trim();
+      if (!/^BV[0-9A-Za-z]{8,12}$/.test(bvid)) return sendJson(res, 400, { ok: false, error: 'bvid 不合法' });
+      if (!/^\d+$/.test(folderId)) return sendJson(res, 400, { ok: false, error: '收藏夹 ID 不合法' });
+      if (fromFolderId && !/^\d+$/.test(fromFolderId)) {
+        return sendJson(res, 400, { ok: false, error: '原收藏夹 ID 不合法' });
+      }
+      if (fromFolderId && fromFolderId === folderId) {
+        return sendJson(res, 400, { ok: false, error: '源收藏夹和目标收藏夹是同一个' });
+      }
+
+      try {
+        const data = await addToMyFav(bvid, d.avid, folderId, fromFolderId || '');
+        // 收藏夹内容变了，本地快照作废，下次打开重新拉（移动的话两边都要清）
+        for (const id of [folderId, fromFolderId].filter(Boolean)) {
+          try {
+            fs.unlinkSync(favCacheFile(id));
+          } catch {
+            /* 本来就没缓存 */
+          }
+        }
+        return sendJson(res, 200, { ok: true, moved: !!fromFolderId, data });
+      } catch (e) {
+        const msg =
+          e.code === -101
+            ? readAuth()
+              ? '登录已失效，请重新登录'
+              : '需要先登录 B 站'
+            : e.message || String(e);
+        return sendJson(res, e.code === -101 ? 401 : 502, { ok: false, error: msg, code: e.code });
+      }
+    }
+
+    if (pathname === '/api/fav/folder/add') {
+      if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: '只支持 POST' });
+      let d;
+      try {
+        d = JSON.parse((await readBody(req, 8 * 1024)) || '{}');
+      } catch {
+        return sendJson(res, 400, { ok: false, error: '不是合法 JSON' });
+      }
+      const title = String(d.title || '').trim().slice(0, 40);
+      if (!title) return sendJson(res, 400, { ok: false, error: '收藏夹名不能为空' });
+      const privacy = d.privacy === true || d.privacy === 1 || d.privacy === '1';
+
+      try {
+        const item = await createMyFavFolder(title, privacy);
+        return sendJson(res, 200, { ok: true, item });
+      } catch (e) {
+        const msg =
+          e.code === -101 ? (readAuth() ? '登录已失效，请重新登录' : '需要先登录 B 站') : e.message || String(e);
+        return sendJson(res, e.code === -101 ? 401 : 502, { ok: false, error: msg, code: e.code });
+      }
     }
 
     if (pathname === '/api/audio') {

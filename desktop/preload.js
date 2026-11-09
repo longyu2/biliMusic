@@ -11,8 +11,11 @@ contextBridge.exposeInMainWorld('appBridge', {
 contextBridge.exposeInMainWorld('desktop', {
   isDesktop: true,
   openMini: () => ipcRenderer.send('mini:open'),
+  openMiniBall: () => ipcRenderer.send('mini:open-ball'),
   onCommand: (cb) => {
     ipcRenderer.on('player:command', (_e, cmd) => cb(cmd));
   },
   reportState: (s) => ipcRenderer.send('player:state', s),
+  // 页面切了白天/夜间主题，主进程据此改原生标题栏（窗口按钮那块）的底色
+  reportTheme: (theme) => ipcRenderer.send('ui:theme', theme === 'light' ? 'light' : 'dark'),
 });
