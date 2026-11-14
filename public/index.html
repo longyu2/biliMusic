@@ -162,6 +162,9 @@
         <div id="cardPager" class="card-pager"></div>
       </div>
 
+      <!-- 搜索分页（只在 B 站搜索视图出现；点页码才去请求） -->
+      <div id="searchPager" class="card-pager search-pager" hidden></div>
+
       <div id="emptyState" class="empty" hidden></div>
     </main>
   </div>
@@ -399,6 +402,16 @@
 </div>
 
 <div id="toast" class="toast" hidden></div>
+
+<!-- ============ 账号切换 ============ -->
+<div id="userMenu" class="user-menu" hidden>
+  <div class="um-head">账号</div>
+  <div id="userList" class="um-list"></div>
+  <div class="um-foot">
+    <button id="userAdd" class="um-btn" type="button">+ 添加账号</button>
+    <button id="userLogout" class="um-btn um-danger" type="button">退出登录</button>
+  </div>
+</div>
 
 <!-- ============ 播放列表（队列）面板 ============ -->
 <div id="queuePanel" class="queue-panel" hidden>

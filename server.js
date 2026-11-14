@@ -17,6 +17,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { Readable } = require('stream');
+const { AsyncLocalStorage } = require('async_hooks');
 
 /* ------------------------------------------------------------------ */
 /* 运行形态探测：源码运行 vs 打包成单文件 exe（Node SEA）                 */
@@ -38,21 +39,205 @@ const PORT = Number(process.env.PORT) || 7788;
 // 默认只监听本机；部署到服务器时用 HOST=0.0.0.0 让局域网可访问
 const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_DIR = path.join(BASE_DIR, 'public');
-// 收藏夹列表存服务端文件，换设备/换浏览器都能看到同一份
+
+/* ------------------------------------------------------------------ */
+/* 多用户数据布局                                                        */
+/*                                                                      */
+/*   data/                                                              */
+/*     active.json          默认账号（新设备没指定时用它）                 */
+/*     common/              所有账号共用的缓存（和账号无关，省流量）         */
+/*       img/ audio/ meta/ season/                                      */
+/*     users/<mid>/         每个 B 站账号一份                             */
+/*       auth.json  library.json  fav/  progress.json  history.json      */
+/*                                                                      */
+/* 没登录时使用 users/guest/，玩法和其他账号完全一样。                     */
+/* ------------------------------------------------------------------ */
+
 const DATA_DIR = process.env.DATA_DIR || path.join(BASE_DIR, 'data');
-const LIBRARY_FILE = path.join(DATA_DIR, 'library.json');
-// 每个收藏夹的歌单单独存一份，打开时直接读盘，不用再去 B 站翻页
-const FAV_DIR = path.join(DATA_DIR, 'fav');
-// 封面图缓存：B 站图床在公网，每次回源都要多等几百毫秒
-const IMG_DIR = path.join(DATA_DIR, 'img');
-// 单独导入的合集快照，和收藏夹缓存分开存
-const SEASON_DIR = path.join(DATA_DIR, 'season');
-// 每个视频的音频码率（要查 playurl 才拿得到，查过就落盘，别反复问 B 站）
-const META_DIR = path.join(DATA_DIR, 'meta');
-// 播放过的音频整文件落盘，第二次播放不再走 B 站，省流量
-const AUDIO_DIR = path.join(DATA_DIR, 'audio');
+const COMMON_DIR = path.join(DATA_DIR, 'common');
+const USERS_DIR = path.join(DATA_DIR, 'users');
+const ACTIVE_FILE = path.join(DATA_DIR, 'active.json');
+
+// 共享缓存：封面图 / 音频 / 码率 / 合集快照 —— 和是哪个账号无关
+const IMG_DIR = path.join(COMMON_DIR, 'img');
+const SEASON_DIR = path.join(COMMON_DIR, 'season');
+const META_DIR = path.join(COMMON_DIR, 'meta');
+const AUDIO_DIR = path.join(COMMON_DIR, 'audio');
+
+// 每个请求一个存储槽，里面记着「这个请求属于哪个账号」
+const als = new AsyncLocalStorage();
+const USER_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
+const GUEST = 'guest';
+
+/** 当前请求的账号 id（路由入口统一写入，业务代码随处可读） */
+function curUser() {
+  const store = als.getStore();
+  return (store && store.user) || GUEST;
+}
+
+/** 当前账号的数据目录 */
+function curDir() {
+  return path.join(USERS_DIR, curUser());
+}
+
+// 每个账号自己的文件（懒取，跟着请求上下文走）
+const libraryFile = () => path.join(curDir(), 'library.json');
+const authFile = () => path.join(curDir(), 'auth.json');
+const progressFile = () => path.join(curDir(), 'progress.json');
+const historyFile = () => path.join(curDir(), 'history.json');
+const favDir = () => path.join(curDir(), 'fav');
+
 const AUDIO_MAX_BYTES = 3 * 1024 * 1024 * 1024; // 缓存上限 3GB，超了按最旧清
 const IMG_MAX_AGE = 'public, max-age=604800'; // 浏览器侧也缓存一周
+
+/* ---------------- 账号目录：查找 / 迁移 / 选择 ---------------- */
+
+function ensureCommonDirs() {
+  for (const d of [COMMON_DIR, IMG_DIR, SEASON_DIR, META_DIR, AUDIO_DIR]) {
+    try {
+      fs.mkdirSync(d, { recursive: true });
+    } catch {}
+  }
+}
+
+function userDirOf(mid) {
+  return path.join(USERS_DIR, USER_ID_RE.test(String(mid)) ? String(mid) : GUEST);
+}
+
+function hasUser(mid) {
+  if (!USER_ID_RE.test(String(mid || ''))) return false;
+  try {
+    return fs.statSync(path.join(USERS_DIR, String(mid))).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** 服务器上已有的账号 id（目录名） */
+function listUserIds() {
+  try {
+    return fs
+      .readdirSync(USERS_DIR, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && USER_ID_RE.test(e.name))
+      .map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
+function readActiveUser() {
+  try {
+    const j = JSON.parse(fs.readFileSync(ACTIVE_FILE, 'utf8'));
+    return j && j.mid ? String(j.mid) : '';
+  } catch {
+    return '';
+  }
+}
+
+function writeActiveUser(mid) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(ACTIVE_FILE, JSON.stringify({ mid: String(mid) }, null, 2), 'utf8');
+  } catch {}
+}
+
+/**
+ * 这个请求用哪个账号：
+ *  1. 前端显式带来的 X-BFP-User（切换账号后带上，多设备可各用各的）
+ *  2. data/active.json 里的默认账号（新设备/没带头的请求）
+ *  3. guest
+ */
+function resolveUser(req) {
+  const raw = req.headers['x-bfp-user'];
+  let want = String(Array.isArray(raw) ? raw[0] : raw || '').trim();
+  // sendBeacon 不能带自定义请求头（关页面时上报进度用），退化成 ?u=<mid>
+  if (!want) {
+    try {
+      want = String(new URL(req.url, 'http://x').searchParams.get('u') || '').trim();
+    } catch {
+      want = '';
+    }
+  }
+  // 明确要「未登录」就用未登录，不要被默认账号顶掉
+  if (want === GUEST) return GUEST;
+  if (want && hasUser(want)) return want;
+  const active = readActiveUser();
+  if (active && hasUser(active)) return active;
+  return GUEST;
+}
+
+/** 某个账号在本地记录的身份信息（不联网，只读 auth.json） */
+function localIdentity(mid) {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(userDirOf(mid), 'auth.json'), 'utf8'));
+    if (!j || !j.sessdata) return null;
+    return { mid: String(j.mid || mid), uname: j.uname || '', face: j.face || '', savedAt: j.savedAt || '' };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 老版本是单用户布局（data/auth.json + data/library.json + data/fav ...），
+ * 第一次启动多用户版本时把这些原地搬进 users/<mid>/，共享缓存搬进 common/。
+ * 只跑一次：users/ 目录存在就直接跳过。
+ */
+function migrateLegacyLayout() {
+  if (fs.existsSync(USERS_DIR)) return;
+  try {
+    fs.mkdirSync(USERS_DIR, { recursive: true });
+  } catch {
+    return;
+  }
+
+  // 共享缓存先搬（注意：必须先建好 common/，否则 rename 到不存在的父目录会失败）
+  try {
+    fs.mkdirSync(COMMON_DIR, { recursive: true });
+  } catch {}
+  for (const name of ['img', 'audio', 'meta', 'season']) {
+    const from = path.join(DATA_DIR, name);
+    const to = path.join(COMMON_DIR, name);
+    try {
+      if (fs.existsSync(from) && !fs.existsSync(to)) fs.renameSync(from, to);
+    } catch (e) {
+      console.warn(`[migrate] ${name} 搬移失败:`, e.message);
+    }
+  }
+  ensureCommonDirs();
+
+  // 判断旧数据属于哪个账号
+  let mid = GUEST;
+  try {
+    const a = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'auth.json'), 'utf8'));
+    if (a && a.mid && USER_ID_RE.test(String(a.mid))) mid = String(a.mid);
+  } catch {
+    /* 没登录过就是 guest */
+  }
+
+  const target = path.join(USERS_DIR, mid);
+  try {
+    fs.mkdirSync(target, { recursive: true });
+  } catch (e) {
+    console.error('[migrate] 建用户目录失败:', e.message);
+    return;
+  }
+
+  const move = (name) => {
+    const from = path.join(DATA_DIR, name);
+    const to = path.join(target, name);
+    try {
+      if (!fs.existsSync(from)) return;
+      if (fs.existsSync(to)) return;
+      fs.renameSync(from, to);
+    } catch (e) {
+      console.warn(`[migrate] ${name} 搬移失败:`, e.message);
+    }
+  };
+
+  for (const f of ['auth.json', 'library.json', 'progress.json', 'history.json', 'fav']) move(f);
+  writeActiveUser(mid);
+  console.log(`[migrate] 已把旧数据迁移到 users/${mid}/，共享缓存放到 common/`);
+}
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -970,42 +1155,62 @@ async function listPublicFolders(mid) {
 /* ------------------------------------------------------------------ */
 
 /**
- * 登录态只存在服务端 data/auth.json（0600），前端永远拿不到 Cookie，
- * 只会拿到 uname / face / mid。退出登录就是删这个文件。
- * 没登录时所有请求行为和以前完全一样（匿名 + buvid）。
+ * 登录态只存在服务端 data/users/<mid>/auth.json（0600），前端永远拿不到 Cookie，
+ * 只会拿到 uname / face / mid。退出登录就是删这个账号的这个文件。
+ * 每个账号一份，互不影响；没登录时用 users/guest/。
  */
-const AUTH_FILE = path.join(DATA_DIR, 'auth.json');
-let authCache = null;
+const authCaches = new Map(); // mid -> auth 对象（null 表示读过了但没有）
 
 function readAuth() {
-  if (authCache) return authCache;
+  const mid = curUser();
+  if (authCaches.has(mid)) return authCaches.get(mid);
+  let v = null;
   try {
-    const j = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
-    authCache = j && j.sessdata && j.biliJct ? j : null;
+    const j = JSON.parse(fs.readFileSync(authFile(), 'utf8'));
+    v = j && j.sessdata && j.biliJct ? j : null;
   } catch {
-    authCache = null;
+    v = null;
   }
-  return authCache;
+  authCaches.set(mid, v);
+  return v;
 }
 
-function writeAuth(data) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = `${AUTH_FILE}.${process.pid}.tmp`;
+/** data 里的 mid 决定落到哪个账号目录（登录时还不知道当前上下文是谁） */
+function writeAuth(data, mid) {
+  const target = String(mid || data.mid || curUser());
+  const dir = userDirOf(target);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'auth.json');
+  const tmp = `${file}.${process.pid}.tmp`;
   // 权限 600：这是账号凭证，同机器其他用户不该能读
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(tmp, AUTH_FILE);
+  fs.renameSync(tmp, file);
   try {
-    fs.chmodSync(AUTH_FILE, 0o600);
+    fs.chmodSync(file, 0o600);
   } catch {
     /* Windows 上 chmod 基本是空操作，忽略 */
   }
-  authCache = data;
+  authCaches.set(target, data);
+
+  // 第一次登录某个账号时，如果它还没有歌单，把「未登录」状态下攒的收藏夹列表带过来，
+  // 免得用户一登录发现左边空了。
+  try {
+    const fromGuest = curUser() === GUEST && target !== GUEST;
+    const dstLib = path.join(dir, 'library.json');
+    const srcLib = path.join(userDirOf(GUEST), 'library.json');
+    if (fromGuest && !fs.existsSync(dstLib) && fs.existsSync(srcLib)) {
+      fs.copyFileSync(srcLib, dstLib);
+    }
+  } catch {
+    /* 带不过来也不影响登录 */
+  }
 }
 
-function clearAuth() {
-  authCache = null;
+function clearAuth(mid) {
+  const target = String(mid || curUser());
+  authCaches.set(target, null);
   try {
-    fs.unlinkSync(AUTH_FILE);
+    fs.unlinkSync(path.join(userDirOf(target), 'auth.json'));
   } catch {
     /* 本来就没有 */
   }
@@ -1157,7 +1362,8 @@ async function qrPoll(key) {
     face: u.face || '',
     savedAt: new Date().toISOString(),
   };
-  writeAuth(saved);
+  writeAuth(saved, saved.mid);
+  writeActiveUser(saved.mid); // 新登录的账号自动成为默认账号
   qrKeys.delete(key);
   return {
     status: 'success',
@@ -1294,7 +1500,7 @@ async function createMyFavFolder(title, privacy) {
  */
 
 function favCacheFile(mediaId) {
-  return path.join(FAV_DIR, `${mediaId}.json`);
+  return path.join(favDir(), `${mediaId}.json`);
 }
 
 function readFavCache(mediaId) {
@@ -1309,7 +1515,7 @@ function readFavCache(mediaId) {
 
 function writeFavCache(mediaId, data) {
   try {
-    fs.mkdirSync(FAV_DIR, { recursive: true });
+    fs.mkdirSync(favDir(), { recursive: true });
     const file = favCacheFile(mediaId);
     const tmp = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify({ savedAt: new Date().toISOString(), ...data }), 'utf8');
@@ -1323,9 +1529,9 @@ function writeFavCache(mediaId, data) {
 function pruneFavCache(keepIds) {
   try {
     const keep = new Set(keepIds.map(String));
-    for (const name of fs.readdirSync(FAV_DIR)) {
+    for (const name of fs.readdirSync(favDir())) {
       if (!name.endsWith('.json')) continue;
-      if (!keep.has(name.slice(0, -5))) fs.unlinkSync(path.join(FAV_DIR, name));
+      if (!keep.has(name.slice(0, -5))) fs.unlinkSync(path.join(favDir(), name));
     }
   } catch {
     /* 目录还不存在，没什么可清的 */
@@ -1385,7 +1591,7 @@ function pruneSeasonCache(keepKeys) {
 
 function readLibrary() {
   try {
-    const raw = fs.readFileSync(LIBRARY_FILE, 'utf8');
+    const raw = fs.readFileSync(libraryFile(), 'utf8');
     const j = JSON.parse(raw);
     return {
       current: j.current ? String(j.current) : null,
@@ -1398,11 +1604,11 @@ function readLibrary() {
 }
 
 function writeLibrary(data) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(curDir(), { recursive: true });
   // 先写临时文件再 rename，避免写一半断电留下坏 JSON
-  const tmp = `${LIBRARY_FILE}.${process.pid}.tmp`;
+  const tmp = `${libraryFile()}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(tmp, LIBRARY_FILE);
+  fs.renameSync(tmp, libraryFile());
 }
 
 /** 把外部传来的数据收敛成安全形状，避免脏数据写进文件 */
@@ -1450,42 +1656,58 @@ function readBody(req, limit = 2 * 1024 * 1024) {
 /* 播放进度持久化（按 bvid 记录到秒，多端共享）                          */
 /* ------------------------------------------------------------------ */
 
-const PROGRESS_FILE = path.join(DATA_DIR, 'progress.json');
 const PROGRESS_MAX = 800; // 最多保留多少首的历史位置
 
-let progressCache = null;
-let progressDirty = false;
+// 每个账号一份进度缓存：mid -> { data, dirty }
+const progressStates = new Map();
 let progressFlushTimer = null;
 
-function loadProgress() {
-  if (progressCache) return progressCache;
+function progressState(mid) {
+  const key = String(mid || curUser());
+  let st = progressStates.get(key);
+  if (st) return st;
+  let data = {};
   try {
-    const j = JSON.parse(fs.readFileSync(PROGRESS_FILE, 'utf8'));
-    progressCache = j && typeof j === 'object' ? j : {};
+    const j = JSON.parse(fs.readFileSync(path.join(userDirOf(key), 'progress.json'), 'utf8'));
+    data = j && typeof j === 'object' ? j : {};
   } catch {
-    progressCache = {};
+    data = {};
   }
-  if (!progressCache.tracks || typeof progressCache.tracks !== 'object') progressCache.tracks = {};
-  if (!progressCache.last || typeof progressCache.last !== 'object') progressCache.last = null;
-  return progressCache;
+  if (!data.tracks || typeof data.tracks !== 'object') data.tracks = {};
+  if (!data.last || typeof data.last !== 'object') data.last = null;
+  st = { data, dirty: false };
+  progressStates.set(key, st);
+  return st;
 }
 
-function flushProgress() {
-  if (!progressDirty || !progressCache) return;
-  progressDirty = false;
+function loadProgress() {
+  return progressState(curUser()).data;
+}
+
+function flushProgress(mid) {
+  const key = String(mid || curUser());
+  const st = progressStates.get(key);
+  if (!st || !st.dirty) return;
+  st.dirty = false;
   try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const tmp = `${PROGRESS_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(progressCache), 'utf8');
-    fs.renameSync(tmp, PROGRESS_FILE);
+    const dir = userDirOf(key);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'progress.json');
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(st.data), 'utf8');
+    fs.renameSync(tmp, file);
   } catch (e) {
     console.error('[progress] 写入失败:', e.message);
   }
 }
 
+function flushAllProgress() {
+  for (const key of progressStates.keys()) flushProgress(key);
+}
+
 /** 播放中每几秒就上报一次，没必要每次都落盘，合并成 4 秒一次 */
 function scheduleFlush() {
-  progressDirty = true;
+  progressState(curUser()).dirty = true;
   if (progressFlushTimer) return;
   progressFlushTimer = setTimeout(() => {
     progressFlushTimer = null;
@@ -1521,43 +1743,59 @@ function recordProgress({ bvid, pos, dur, mediaId }) {
 /* 播放历史（每次播放记一条明细，另存一份按歌聚合的统计）               */
 /* ------------------------------------------------------------------ */
 
-const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
 const HISTORY_MAX = 5000; // 明细最多留多少条
 const HISTORY_STATS_MAX = 2000; // 聚合最多留多少首
 
-let historyCache = null;
-let historyDirty = false;
+// 每个账号一份历史：mid -> { data, dirty }
+const historyStates = new Map();
 let historyFlushTimer = null;
 
-function loadHistory() {
-  if (historyCache) return historyCache;
+function historyState(mid) {
+  const key = String(mid || curUser());
+  let st = historyStates.get(key);
+  if (st) return st;
+  let data = {};
   try {
-    const j = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
-    historyCache = j && typeof j === 'object' ? j : {};
+    const j = JSON.parse(fs.readFileSync(path.join(userDirOf(key), 'history.json'), 'utf8'));
+    data = j && typeof j === 'object' ? j : {};
   } catch {
-    historyCache = {};
+    data = {};
   }
-  if (!Array.isArray(historyCache.entries)) historyCache.entries = [];
-  if (!historyCache.stats || typeof historyCache.stats !== 'object') historyCache.stats = {};
-  return historyCache;
+  if (!Array.isArray(data.entries)) data.entries = [];
+  if (!data.stats || typeof data.stats !== 'object') data.stats = {};
+  st = { data, dirty: false };
+  historyStates.set(key, st);
+  return st;
 }
 
-function flushHistory() {
-  if (!historyDirty || !historyCache) return;
-  historyDirty = false;
+function loadHistory() {
+  return historyState(curUser()).data;
+}
+
+function flushHistory(mid) {
+  const key = String(mid || curUser());
+  const st = historyStates.get(key);
+  if (!st || !st.dirty) return;
+  st.dirty = false;
   try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const tmp = `${HISTORY_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(historyCache), 'utf8');
-    fs.renameSync(tmp, HISTORY_FILE);
+    const dir = userDirOf(key);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'history.json');
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(st.data), 'utf8');
+    fs.renameSync(tmp, file);
   } catch (e) {
     console.error('[history] 写入失败:', e.message);
   }
 }
 
+function flushAllHistory() {
+  for (const key of historyStates.keys()) flushHistory(key);
+}
+
 /** 切歌时才会写一条，没必要每条都落盘，合并成 1 秒一次 */
 function scheduleHistoryFlush() {
-  historyDirty = true;
+  historyState(curUser()).dirty = true;
   if (historyFlushTimer) return;
   historyFlushTimer = setTimeout(() => {
     historyFlushTimer = null;
@@ -1646,8 +1884,7 @@ function serveStatic(req, res, pathname) {
 /* 路由                                                                 */
 /* ------------------------------------------------------------------ */
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+async function route(req, res, url) {
   const { pathname, searchParams } = url;
 
   try {
@@ -1864,6 +2101,85 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, map });
     }
 
+    /* ---- 多账号 ---- */
+    if (pathname === '/api/users') {
+      const ids = listUserIds();
+      if (!ids.includes(GUEST)) ids.unshift(GUEST);
+      const users = ids.map((mid) => {
+        const id = localIdentity(mid);
+        return {
+          mid,
+          guest: mid === GUEST,
+          loggedIn: !!id,
+          uname: id ? id.uname : mid === GUEST ? '未登录' : `账号 ${mid}`,
+          face: id ? id.face : '',
+        };
+      });
+      return sendJson(res, 200, {
+        ok: true,
+        current: curUser(),
+        active: readActiveUser() || GUEST,
+        users,
+      });
+    }
+
+    if (pathname === '/api/users/select') {
+      if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: '只支持 POST' });
+      let d;
+      try {
+        d = JSON.parse((await readBody(req, 4 * 1024)) || '{}');
+      } catch {
+        return sendJson(res, 400, { ok: false, error: '不是合法 JSON' });
+      }
+      const mid = String(d.mid || '').trim();
+      if (!USER_ID_RE.test(mid)) return sendJson(res, 400, { ok: false, error: '账号 id 不合法' });
+      if (!hasUser(mid) && mid !== GUEST) return sendJson(res, 404, { ok: false, error: '没有这个账号' });
+      try {
+        fs.mkdirSync(userDirOf(mid), { recursive: true });
+      } catch {}
+      writeActiveUser(mid);
+      return sendJson(res, 200, { ok: true, current: mid });
+    }
+
+    if (pathname === '/api/users/logout') {
+      if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: '只支持 POST' });
+      let d;
+      try {
+        d = JSON.parse((await readBody(req, 4 * 1024)) || '{}');
+      } catch {
+        return sendJson(res, 400, { ok: false, error: '不是合法 JSON' });
+      }
+      const mid = String(d.mid || curUser()).trim();
+      if (!USER_ID_RE.test(mid)) return sendJson(res, 400, { ok: false, error: '账号 id 不合法' });
+      clearAuth(mid); // 只删登录态，这个账号的歌单/历史还留着
+      return sendJson(res, 200, { ok: true, mid });
+    }
+
+    if (pathname === '/api/users/delete') {
+      if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: '只支持 POST' });
+      let d;
+      try {
+        d = JSON.parse((await readBody(req, 4 * 1024)) || '{}');
+      } catch {
+        return sendJson(res, 400, { ok: false, error: '不是合法 JSON' });
+      }
+      const mid = String(d.mid || '').trim();
+      if (!USER_ID_RE.test(mid) || mid === GUEST) {
+        return sendJson(res, 400, { ok: false, error: '这个账号不能删除' });
+      }
+      const dir = userDirOf(mid);
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch (e) {
+        return sendJson(res, 500, { ok: false, error: '删除失败：' + e.message });
+      }
+      authCaches.delete(mid);
+      progressStates.delete(mid);
+      historyStates.delete(mid);
+      if (readActiveUser() === mid) writeActiveUser(GUEST);
+      return sendJson(res, 200, { ok: true, mid });
+    }
+
     if (pathname === '/api/login/qr') {
       try {
         const qr = await qrGenerate();
@@ -1993,6 +2309,26 @@ const server = http.createServer(async (req, res) => {
     }
     return sendJson(res, 500, { ok: false, error: e.message || String(e) });
   }
+}
+
+/* 第一次启动多用户版本：把老的单用户数据搬进 users/<mid>/ */
+migrateLegacyLayout();
+ensureCommonDirs();
+try {
+  fs.mkdirSync(userDirOf(readActiveUser() || GUEST), { recursive: true });
+} catch {}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const user = resolveUser(req);
+  // 整个请求都在这个账号的上下文里跑：curUser()/curDir() 都取到这里
+  als.run({ user }, () => {
+    route(req, res, url).catch((e) => {
+      try {
+        sendJson(res, 500, { ok: false, error: e.message || String(e) });
+      } catch {}
+    });
+  });
 });
 
 server.listen(PORT, HOST, () => {
@@ -2026,11 +2362,15 @@ server.on('error', (e) => {
   throw e;
 });
 
-// 退出前把还没落盘的播放进度写完（pm2 restart 走 SIGINT）
-process.on('exit', () => flushProgress());
+// 退出前把所有账号还没落盘的进度/历史写完（pm2 restart 走 SIGINT）
+process.on('exit', () => {
+  flushAllProgress();
+  flushAllHistory();
+});
 ['SIGINT', 'SIGTERM'].forEach((sig) => {
   process.on(sig, () => {
-    flushProgress();
+    flushAllProgress();
+    flushAllHistory();
     process.exit(0);
   });
 });

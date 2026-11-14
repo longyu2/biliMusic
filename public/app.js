@@ -102,8 +102,44 @@ function toast(msg, ms = 2200) {
   }, ms);
 }
 
+/* ---------------- 当前账号（多用户） ---------------- */
+
+// 注意：不能和 LS.user 撞键 —— 那个存的是 { mid, uname, face } 的 JSON 缓存
+const LS_USER = 'bfp.uid';
+
+/** 本机选定的 B 站账号 mid；空表示跟随服务端默认 */
+function currentUserId() {
+  try {
+    return localStorage.getItem(LS_USER) || '';
+  } catch {
+    return '';
+  }
+}
+
+function setCurrentUserId(mid) {
+  try {
+    if (mid) localStorage.setItem(LS_USER, String(mid));
+    else localStorage.removeItem(LS_USER);
+  } catch {}
+}
+
+/** 所有请求都带上账号，服务端据此决定读写哪个 users/<mid>/ */
+function userHeaders(extra) {
+  const h = extra || {};
+  const mid = currentUserId();
+  if (mid) h['X-BFP-User'] = mid;
+  return h;
+}
+
+/** sendBeacon 不能带请求头，账号信息走查询串 */
+function beaconUrl(path) {
+  const mid = currentUserId();
+  if (!mid) return path;
+  return path + (path.includes('?') ? '&' : '?') + 'u=' + encodeURIComponent(mid);
+}
+
 async function api(path) {
-  const r = await fetch(path);
+  const r = await fetch(path, { headers: userHeaders() });
   const ct = r.headers.get('content-type') || '';
   if (!ct.includes('application/json')) throw new Error(`服务异常 (HTTP ${r.status})`);
   return r.json();
@@ -120,7 +156,7 @@ function persist() {
     try {
       const r = await fetch('/api/library', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: userHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ current: state.mediaId, folders: state.folders }),
       });
       const j = await r.json();
@@ -137,7 +173,7 @@ function persist() {
 
 async function fetchLibrary() {
   try {
-    const r = await fetch('/api/library');
+    const r = await fetch('/api/library', { headers: userHeaders() });
     const j = await r.json();
     if (j && j.ok) {
       return {
@@ -450,6 +486,8 @@ function renderCurrent() {
   if (cols) cols.hidden = cardMode; // 卡片视图不需要「#/歌曲/UP/时长」表头
   if (list) list.hidden = cardMode;
   if (pane) pane.hidden = !cardMode;
+
+  renderSearchPager(); // 搜索时才有分页条
 
   if (!state.view.length) {
     if (pane) pane.hidden = true;
@@ -767,6 +805,101 @@ function searchBarText() {
 }
 
 let searching = false;
+
+/* ---------------- 搜索分页（一次显示 5 个页码，点了才请求） ---------------- */
+
+const SEARCH_PAGE_WIN = 5;
+
+/** 画分页条：窗口式显示 5 个页码，当前页高亮，两侧有上一页/下一页 */
+function renderSearchPager() {
+  const box = $('#searchPager');
+  if (!box) return;
+
+  const s = state.search;
+  if (state.listMode !== 'search' || !s || !s.pages || s.pages <= 1) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+
+  const total = s.pages;
+  const cur = Math.min(Math.max(1, s.page || 1), total);
+  let start = Math.max(cur - Math.floor(SEARCH_PAGE_WIN / 2), 1);
+  start = Math.min(start, Math.max(1, total - SEARCH_PAGE_WIN + 1));
+  const end = Math.min(total, start + SEARCH_PAGE_WIN - 1);
+
+  box.innerHTML = '';
+
+  const mk = (label, page, opts) => {
+    const o = opts || {};
+    const b = document.createElement('button');
+    b.className = 'pg-btn' + (o.on ? ' on' : '');
+    b.textContent = label;
+    if (o.disabled) b.disabled = true;
+    else b.addEventListener('click', () => gotoSearchPage(page));
+    return b;
+  };
+
+  box.appendChild(mk('上一页', cur - 1, { disabled: cur <= 1 }));
+  for (let p = start; p <= end; p++) box.appendChild(mk(String(p), p, { on: p === cur }));
+  box.appendChild(mk('下一页', cur + 1, { disabled: cur >= total }));
+
+  const info = document.createElement('span');
+  info.className = 'pg-info';
+  info.textContent = `第 ${cur} / ${total} 页`;
+  box.appendChild(info);
+
+  box.hidden = false;
+}
+
+/** 翻到搜索结果的第 n 页：点页码时才真的去请求 B 站 */
+async function gotoSearchPage(n) {
+  const s = state.search;
+  if (!s || !s.keyword || searching) return;
+  const total = s.pages || 0;
+  const page = Math.max(1, Math.min(Number(n) || 1, total || 1));
+  if (page === (s.page || 1) && state.tracks.length) return; // 点的是当前页
+
+  searching = true;
+  const prevPage = s.page || 1;
+  $('#favSub').textContent = `正在读取第 ${page} 页…`;
+
+  try {
+    const data = await api(`/api/search?keyword=${encodeURIComponent(s.keyword)}&page=${page}`);
+    if (!data.ok) throw new Error(data.error || '搜索失败');
+    // 这期间退出搜索 / 换了关键词：这次结果作废
+    if (state.listMode !== 'search' || !state.search || state.search.keyword !== s.keyword) return;
+
+    state.search = data;
+    state.tracks = data.tracks || [];
+    state.query = '';
+    state.playingIndex = state.playingTrack
+      ? state.tracks.findIndex((t) => t.bvid === state.playingTrack.bvid)
+      : -1;
+    state.shuffleQueue = [];
+    state.shufflePos = -1;
+    rebuildView();
+
+    const count = state.tracks.length;
+    $('#favSub').textContent =
+      `B站搜索 · 第 ${data.page || page} 页 · ${count} 首` +
+      (data.total ? ` · 共约 ${data.total} 个结果` : '');
+    showSearchBar(searchBarText());
+    if (!count) toast('这一页没有结果', 1800);
+
+    // 翻页后回到顶部
+    const pane = $('.list-pane');
+    if (pane) pane.scrollTop = 0;
+
+    enrichSearchSeasons();
+  } catch (e) {
+    state.search.page = prevPage; // 失败保持原页码，分页条不要跳
+    renderSearchPager();
+    toast('翻页失败：' + e.message, 3000);
+  } finally {
+    searching = false;
+  }
+}
 
 /**
  * 在 B 站搜视频，只取第一页（20 条）。
@@ -1121,7 +1254,7 @@ function renderAccount() {
   const btn = $('#acctBtn');
   if (!btn) return;
   const u = state.user;
-  btn.title = u ? `已登录：${u.uname}（点击查看 / 退出）` : '登录 B 站';
+  btn.title = u ? `已登录：${u.uname}（点击切换账号）` : '登录 B 站 / 切换账号';
   btn.classList.toggle('on', !!u);
   if (u && u.face) {
     btn.classList.add('has-avatar');
@@ -1208,16 +1341,34 @@ async function pollQr() {
   if (j.status === 'success') {
     stopQrPolling();
     qrKey = null;
+    const prevMid = state.user && state.user.mid;
     state.user = j.user;
     rememberUser(state.user);
     renderAccount();
     renderLoginState();
     toast(`已登录：${j.user.uname}`, 2200);
+
+    // 切到这个账号：之后所有请求都带着它的 mid，数据各自独立
+    const mid = j.user && j.user.mid;
+    const changed = !!(mid && mid !== prevMid);
+    if (mid) {
+      setCurrentUserId(mid);
+      try {
+        fetch('/api/users/select', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mid }),
+        });
+      } catch {}
+    }
+
     if (!$('#favPickModal').hidden) loadFavFolders();
     if (!$('#modal').hidden && modalTab === 'mine') loadMineFolders();
     if (!$('#loginModal').hidden) loadAcctFolders();
     setTimeout(() => {
       if (!$('#loginModal').hidden) closeLogin();
+      // 换了个账号：重新载入，让收藏夹/进度/历史都换成这个账号的
+      if (changed) location.reload();
     }, 900);
     return;
   }
@@ -1244,7 +1395,149 @@ function closeLogin() {
   $('#loginModal').hidden = true;
 }
 
-if ($('#acctBtn')) $('#acctBtn').addEventListener('click', openLogin);
+if ($('#acctBtn')) $('#acctBtn').addEventListener('click', openUserMenu);
+
+/* ---------------- 账号切换菜单 ---------------- */
+
+function positionUserMenu(menu, btn) {
+  const r = btn.getBoundingClientRect();
+  const rect = menu.getBoundingClientRect();
+  const pad = 8;
+  let left = r.right - rect.width;
+  left = Math.max(pad, Math.min(left, window.innerWidth - rect.width - pad));
+  let top = r.bottom + 8;
+  if (top + rect.height > window.innerHeight - pad) top = Math.max(pad, r.top - rect.height - 8);
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+}
+
+function renderUserList(j) {
+  const list = $('#userList');
+  if (!list) return;
+  list.innerHTML = '';
+  const cur = j.current;
+  const users = j.users || [];
+
+  for (const u of users) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'um-item' + (u.mid === cur ? ' on' : '');
+
+    const av = document.createElement('div');
+    av.className = 'um-avatar';
+    if (u.face) av.style.backgroundImage = `url('${imgUrl(u.face, '@80w_80h_1c')}')`;
+    row.appendChild(av);
+
+    const txt = document.createElement('div');
+    txt.className = 'um-text';
+    const name = document.createElement('div');
+    name.className = 'um-name';
+    name.textContent = u.uname || (u.guest ? '未登录' : u.mid);
+    const sub = document.createElement('div');
+    sub.className = 'um-sub';
+    sub.textContent = u.guest
+      ? '不登录 B 站，导入的列表也存在这里'
+      : u.loggedIn
+      ? `mid ${u.mid}`
+      : `mid ${u.mid} · 登录已失效`;
+    txt.appendChild(name);
+    txt.appendChild(sub);
+    row.appendChild(txt);
+
+    if (u.mid === cur) {
+      const tag = document.createElement('span');
+      tag.className = 'um-cur';
+      tag.textContent = '✓';
+      row.appendChild(tag);
+    }
+
+    row.addEventListener('click', () => switchUser(u.mid));
+    list.appendChild(row);
+  }
+
+  const logout = $('#userLogout');
+  const me = users.find((u) => u.mid === cur);
+  if (logout) logout.hidden = !me || !me.loggedIn;
+}
+
+async function openUserMenu() {
+  const menu = $('#userMenu');
+  const btn = $('#acctBtn');
+  if (!menu || !btn) return;
+  if (!menu.hidden) {
+    menu.hidden = true;
+    return;
+  }
+
+  menu.hidden = false;
+  const list = $('#userList');
+  list.innerHTML = '<div class="um-loading">正在读取…</div>';
+  positionUserMenu(menu, btn);
+
+  try {
+    const j = await api('/api/users');
+    if (!j.ok) throw new Error(j.error || '读取失败');
+    renderUserList(j);
+  } catch (e) {
+    list.innerHTML = `<div class="um-loading">读取失败：${escapeHtml(e.message)}</div>`;
+  }
+  positionUserMenu(menu, btn);
+}
+
+function hideUserMenu() {
+  const menu = $('#userMenu');
+  if (menu) menu.hidden = true;
+}
+
+/** 切换账号：记住选择 → 通知服务端默认账号 → 重载页面 */
+async function switchUser(mid) {
+  hideUserMenu();
+  setCurrentUserId(mid);
+  rememberUser(null); // 清掉上一个账号的昵称/头像缓存，避免切过去还闪一下旧头像
+  try {
+    await fetch('/api/users/select', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mid }),
+    });
+  } catch {
+    /* 服务端没记上也无所谓，本机 localStorage 已经生效 */
+  }
+  location.reload();
+}
+
+$('#userAdd') && $('#userAdd').addEventListener('click', () => {
+  hideUserMenu();
+  openLogin();
+});
+
+$('#userLogout') &&
+  $('#userLogout').addEventListener('click', async () => {
+    hideUserMenu();
+    if (!confirm('退出这个账号的 B 站登录？\n收藏夹列表、播放历史都会保留。')) return;
+    try {
+      await fetch('/api/users/logout', {
+        method: 'POST',
+        headers: userHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ mid: currentUserId() }),
+      });
+      rememberUser(null);
+      location.reload();
+    } catch (e) {
+      toast('退出失败：' + e.message, 2600);
+    }
+  });
+
+document.addEventListener('mousedown', (e) => {
+  const menu = $('#userMenu');
+  if (!menu || menu.hidden) return;
+  if (menu.contains(e.target) || (e.target.closest && e.target.closest('#acctBtn'))) return;
+  hideUserMenu();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') hideUserMenu();
+});
+window.addEventListener('blur', hideUserMenu);
 if ($('#loginClose')) $('#loginClose').addEventListener('click', closeLogin);
 if ($('#loginRefresh')) $('#loginRefresh').addEventListener('click', refreshQr);
 if ($('#loginModal')) {
@@ -1255,7 +1548,7 @@ if ($('#loginModal')) {
 if ($('#loginLogout')) {
   $('#loginLogout').addEventListener('click', async () => {
     try {
-      await fetch('/api/login/logout', { method: 'POST' });
+      await fetch('/api/login/logout', { method: 'POST', headers: userHeaders() });
     } catch {
       /* 忽略：本地照样清掉界面状态 */
     }
@@ -2499,7 +2792,7 @@ let restoring = false;
 
 async function fetchLastProgress() {
   try {
-    const r = await fetch('/api/progress');
+    const r = await fetch('/api/progress', { headers: userHeaders() });
     const j = await r.json();
     return j && j.ok ? j : null;
   } catch {
@@ -2526,7 +2819,7 @@ function reportProgress(force = false) {
   // 关页面时普通 fetch 会被浏览器掐掉，用 sendBeacon 才发得出去
   if (force && navigator.sendBeacon) {
     try {
-      navigator.sendBeacon('/api/progress', new Blob([payload], { type: 'application/json' }));
+      navigator.sendBeacon(beaconUrl('/api/progress'), new Blob([payload], { type: 'application/json' }));
       return;
     } catch {
       /* 退回 fetch */
@@ -2535,7 +2828,7 @@ function reportProgress(force = false) {
 
   fetch('/api/progress', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: userHeaders({ 'Content-Type': 'application/json' }),
     body: payload,
   }).catch(() => {});
 }
@@ -2572,7 +2865,7 @@ function histEnd() {
   // 关页面时普通 fetch 会被浏览器掐掉，用 sendBeacon 才发得出去
   if (navigator.sendBeacon) {
     try {
-      navigator.sendBeacon('/api/history', new Blob([payload], { type: 'application/json' }));
+      navigator.sendBeacon(beaconUrl('/api/history'), new Blob([payload], { type: 'application/json' }));
       return;
     } catch {
       /* 退回 fetch */
@@ -2580,7 +2873,7 @@ function histEnd() {
   }
   fetch('/api/history', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: userHeaders({ 'Content-Type': 'application/json' }),
     body: payload,
   }).catch(() => {});
 }
