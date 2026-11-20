@@ -3488,6 +3488,9 @@ function startComments(bvid) {
   cmt.bvid = bvid;
   cmt.next = '';
   cmt.end = false;
+  // 作废还在飞的请求：换歌 / 换排序时不能等它，否则会贴上去上一批评论
+  cmt.loading = false;
+  cmt.token++;
   cmtListEl.innerHTML = '<div class="cmt-empty">正在加载评论…</div>';
   $('#cmtCount').textContent = '';
   $('#cmtOpenBili').href = `https://www.bilibili.com/video/${encodeURIComponent(bvid)}`;
