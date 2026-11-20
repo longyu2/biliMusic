@@ -517,8 +517,41 @@ function brLabel(t) {
   return t.bitrateChecked ? '—' : '…';
 }
 
+/** 只给「已知」的码率文案；查不到 / 还没查返回空串 */
+function bitrateText(t) {
+  const v = t ? brLabel(t) : '';
+  return v === '…' || v === '—' ? '' : v;
+}
+
+/**
+ * 底栏 / 放大视图里的「UP 主 · 码率」。
+ * 码率是后台异步补全的，拿到之后 bvRateApplied() 会再调一次这里刷新。
+ */
+function refreshNowPlayingMeta() {
+  const t = currentTrack();
+  const up = (t && t.upper) || '—';
+  const br = bitrateText(t);
+
+  const small = $('#npUpper');
+  if (small) small.textContent = br ? `${up} · ${br}` : up;
+
+  const big = $('#npBigUpper');
+  if (big) big.textContent = up;
+
+  const chip = $('#npBigBr');
+  if (chip) {
+    const parts = [];
+    if (br) parts.push(br);
+    if (videoMode && videoQuality) parts.push(videoQuality);
+    chip.textContent = parts.join(' · ');
+    chip.hidden = !parts.length;
+    chip.classList.toggle('hi', videoMode);
+  }
+}
+
 const brQueue = [];
 const brSeen = new Set(); // 本轮去重，防止同一 bvid 重复入队
+const brKnown = new Map(); // bvid -> { bandwidth, quality, estimated }：查过一次就记住
 let brRunning = false;
 
 /** 入队查码率——不跳过已查过的，已缓存的在服务端秒回，代价很小 */
@@ -526,6 +559,20 @@ function queueBitrates(tracks) {
   let added = false;
   for (const t of tracks) {
     if (!t || !t.bvid) continue;
+
+    // 同一个视频换个对象出现（比如又从列表加进播放列表），直接套用已知码率
+    const known = brKnown.get(t.bvid);
+    if (known) {
+      if (!t.bandwidth && known.bandwidth) {
+        t.bandwidth = known.bandwidth;
+        t.quality = known.quality || 0;
+        t.estimated = !!known.estimated;
+        t.bitrateChecked = true;
+        bvRateApplied(t, known);
+      }
+      continue;
+    }
+
     if (brSeen.has(t.bvid)) continue;
     brSeen.add(t.bvid);
     brQueue.push(t);
@@ -566,6 +613,7 @@ function bvRateApplied(t, b) {
     t.bandwidth = b.bandwidth;
     t.quality = b.quality || 0;
     t.estimated = !!b.estimated;
+    brKnown.set(t.bvid, { bandwidth: t.bandwidth, quality: t.quality, estimated: t.estimated });
   }
   const txt = brLabel(t);
   document.querySelectorAll(`[data-bvid="${t.bvid}"] .t-br`).forEach((el) => {
@@ -577,6 +625,13 @@ function bvRateApplied(t, b) {
     el.textContent = t.bandwidth ? fmtBitrate(t.bandwidth, t.estimated) : '';
     el.hidden = !t.bandwidth;
   });
+  // 播放列表里的码率角标
+  document.querySelectorAll(`[data-bvid="${t.bvid}"] .q-br`).forEach((el) => {
+    el.textContent = bitrateText(t) || '—';
+  });
+  // 正播着这首：底栏和放大视图上的码率也跟着更新
+  const cur = currentTrack();
+  if (cur && cur.bvid === t.bvid) refreshNowPlayingMeta();
 }
 
 /* ---------------- 卡片视图（分页） ---------------- */
@@ -1822,7 +1877,7 @@ function playQueuedTrack(t) {
   const cover = t.cover ? imgUrl(t.cover, '@200w_200h_1c') : '';
   $('#npCover').style.backgroundImage = cover ? `url('${cover}')` : '';
   $('#npTitle').textContent = t.title;
-  $('#npUpper').textContent = t.upper || '—';
+  refreshNowPlayingMeta();
   document.title = `${t.title} · ${t.upper || 'B站'}`;
 
   pendingSeek = 0;
@@ -1889,6 +1944,7 @@ function renderQueuePanel() {
     row.className = 'queue-row' + (i === 0 ? ' now' : '');
     row.draggable = i > 0;
     row.dataset.i = i;
+    row.dataset.bvid = t.bvid || '';
 
     const cover = document.createElement('div');
     cover.className = 'q-cover';
@@ -1906,6 +1962,12 @@ function renderQueuePanel() {
     text.appendChild(title);
     text.appendChild(sub);
     row.appendChild(text);
+
+    // 每首的码率（查过的立刻有值，没查过的显示 …，后台会补上）
+    const br = document.createElement('span');
+    br.className = 'q-br';
+    br.textContent = bitrateText(t) || '…';
+    row.appendChild(br);
 
     if (i === 0) {
       const tag = document.createElement('span');
@@ -1955,6 +2017,9 @@ function renderQueuePanel() {
 
     list.appendChild(row);
   });
+
+  // 队列里的每首也都要有码率
+  queueBitrates(state.queue);
 }
 
 function toggleQueuePanel() {
@@ -2097,7 +2162,7 @@ function playAt(trackIndex) {
   const cover = t.cover ? imgUrl(t.cover, '@200w_200h_1c') : '';
   $('#npCover').style.backgroundImage = cover ? `url('${cover}')` : '';
   $('#npTitle').textContent = t.title;
-  $('#npUpper').textContent = t.upper || '—';
+  refreshNowPlayingMeta();
   document.title = `${t.title} · ${t.upper || 'B站'}`;
 
   // 上次中断的位置由 restoreLast 直接写进 pendingSeek；主动切歌一律从头播
@@ -2610,6 +2675,92 @@ function toggleTheme() {
 if ($('#themeBtn')) $('#themeBtn').addEventListener('click', toggleTheme);
 // 页面 head 里的内联脚本已经先设过一次，这里只是把按钮状态对上
 applyTheme(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark', false);
+
+/* ---------------- 设置（放大视图的默认显示） ---------------- */
+
+const LS_NPVIEW = 'bfp.npview'; // 'visual' 唱片+频谱 / 'video' 直接出画面
+const LS_NPCMT = 'bfp.npcmt'; // '1' 放大时自动带出评论区
+
+/** 放大视图默认看什么 */
+function prefNpView() {
+  try {
+    return localStorage.getItem(LS_NPVIEW) === 'video' ? 'video' : 'visual';
+  } catch {
+    return 'visual';
+  }
+}
+
+/** 放大时是否自动开评论（默认关，和加这个设置之前的行为一致） */
+function prefNpComments() {
+  try {
+    return localStorage.getItem(LS_NPCMT) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function syncSettingsUI() {
+  const v = prefNpView();
+  document.querySelectorAll('#segView button').forEach((b) => b.classList.toggle('on', b.dataset.val === v));
+  const c = prefNpComments() ? '1' : '0';
+  document.querySelectorAll('#segCmt button').forEach((b) => b.classList.toggle('on', b.dataset.val === c));
+}
+
+function setPref(key, val) {
+  try {
+    localStorage.setItem(key, val);
+  } catch {
+    /* 隐私模式写不进去就算了，这次会话内仍然生效 */
+  }
+  syncSettingsUI();
+}
+
+function hideSettings() {
+  const menu = $('#setMenu');
+  if (menu) menu.hidden = true;
+}
+
+function toggleSettings() {
+  const menu = $('#setMenu');
+  const btn = $('#settingsBtn');
+  if (!menu || !btn) return;
+  if (!menu.hidden) {
+    menu.hidden = true;
+    return;
+  }
+  hideUserMenu();
+  menu.hidden = false;
+  syncSettingsUI();
+  positionUserMenu(menu, btn); // 定位逻辑和账号菜单共用一套
+}
+
+const settingsBtn = $('#settingsBtn');
+if (settingsBtn) {
+  settingsBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleSettings();
+  });
+}
+
+document.querySelectorAll('#segView button').forEach((b) => {
+  b.addEventListener('click', () => setPref(LS_NPVIEW, b.dataset.val));
+});
+document.querySelectorAll('#segCmt button').forEach((b) => {
+  b.addEventListener('click', () => setPref(LS_NPCMT, b.dataset.val));
+});
+
+document.addEventListener('mousedown', (e) => {
+  const menu = $('#setMenu');
+  if (!menu || menu.hidden) return;
+  if (menu.contains(e.target) || (e.target.closest && e.target.closest('#settingsBtn'))) return;
+  menu.hidden = true;
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') hideSettings();
+});
+window.addEventListener('resize', hideSettings);
+
+syncSettingsUI();
 
 // 列表 / 卡片视图切换
 if ($('#viewBtn')) {
@@ -3145,7 +3296,7 @@ function renderNp() {
   $('#npArt').style.backgroundImage = big ? `url('${big}')` : '';
   $('#npBg').style.backgroundImage = big ? `url('${big}')` : '';
   $('#npBigTitle').textContent = t.title;
-  $('#npBigUpper').textContent = t.upper || '—';
+  refreshNowPlayingMeta();
   updateProgressUI(audio.currentTime, totalDuration());
 
   // 开着视频 / 评论面板时切歌，两个面板都跟着换内容
@@ -3160,6 +3311,11 @@ function openNp() {
   }
   renderNp();
   npView.hidden = false;
+  // 设置里选的默认显示方式：视频 / 可视化（唱片+频谱），评论同理
+  const wantVideo = prefNpView() === 'video';
+  if (wantVideo !== videoMode) setVideoMode(wantVideo);
+  if (prefNpComments()) openComments();
+  else hideComments();
   // 等布局完成再量画布尺寸
   requestAnimationFrame(() => startViz());
 }
@@ -3214,12 +3370,14 @@ const cmtListEl = $('#cmtList');
 let videoMode = false; // 画面开关
 let videoWant = ''; // 正在为哪首加载（防止切歌后旧请求把画面贴错）
 let videoReady = false;
+let videoQuality = ''; // 当前画面的清晰度（720P 之类），和码率一起显示
 
 const cmt = { open: false, sort: 'hot', next: '', bvid: '', loading: false, end: false, count: 0, token: 0 };
 
 function npVideoReset(tip) {
   videoReady = false;
   videoWant = '';
+  videoQuality = '';
   npVideoBox.classList.remove('ready');
   npVideoTip.hidden = false;
   npVideoTip.textContent = tip || '';
@@ -3228,6 +3386,7 @@ function npVideoReset(tip) {
     npVideoEl.removeAttribute('src');
     npVideoEl.load();
   } catch {}
+  refreshNowPlayingMeta();
 }
 
 function setVideoMode(on) {
@@ -3240,6 +3399,7 @@ function setVideoMode(on) {
   npView.classList.toggle('video-mode', videoMode);
   $('#npVideoBtn').classList.toggle('on', videoMode);
   npVideoBox.hidden = !videoMode;
+  refreshNowPlayingMeta();
   if (!videoMode) {
     npVideoReset('正在获取视频…');
     return;
@@ -3264,6 +3424,8 @@ async function loadVideo(t) {
       return;
     }
     npVideoTip.textContent = (j.stream.label ? j.stream.label + ' · ' : '') + '加载中…';
+    videoQuality = j.stream.label || '';
+    refreshNowPlayingMeta();
     npVideoEl.src = `/api/video/stream?bvid=${encodeURIComponent(t.bvid)}&cid=${encodeURIComponent(j.cid || '')}`;
     npVideoEl.load();
     whenVideoReady(() => {
@@ -3441,6 +3603,27 @@ function appendComments(list, kind) {
   cmtListEl.insertAdjacentHTML('beforeend', html);
 }
 
+/** 第一页评论缓存：开关放大视图很频繁，同一首别每次都请求 */
+const cmtPage1 = new Map(); // `${bvid}|${sort}` -> { data, ts }
+const CMT_CACHE_TTL = 10 * 60 * 1000;
+
+/** 把一页评论画进面板（首屏 / 翻页共用） */
+function paintCommentsPage(j, reset) {
+  cmt.count = j.count || 0;
+  cmt.next = j.next || '';
+  cmt.end = !!j.isEnd || !cmt.next;
+
+  if (reset) cmtListEl.innerHTML = '';
+  appendComments(j.top || [], 'top');
+  appendComments(j.replies || [], 'more');
+
+  $('#cmtCount').textContent = cmt.count ? `${fmtNum(cmt.count)} 条` : '';
+  if (!cmtListEl.children.length) cmtListEl.innerHTML = '<div class="cmt-empty">还没有人评论</div>';
+  const more = $('#cmtMore');
+  more.hidden = cmt.end;
+  more.textContent = '加载更多';
+}
+
 async function loadComments(reset) {
   if (!cmt.bvid || cmt.loading) return;
   if (!reset && cmt.end) return;
@@ -3459,18 +3642,13 @@ async function loadComments(reset) {
     if (token !== cmt.token) return; // 又切歌 / 又换排序了，这次结果丢掉
     if (!j || !j.ok) throw new Error((j && j.error) || '评论加载失败');
 
-    cmt.count = j.count || 0;
-    cmt.next = j.next || '';
-    cmt.end = !!j.isEnd || !cmt.next;
+    paintCommentsPage(j, reset);
 
-    if (reset) cmtListEl.innerHTML = '';
-    appendComments(j.top || [], 'top');
-    appendComments(j.replies || [], 'more');
-
-    $('#cmtCount').textContent = cmt.count ? `${fmtNum(cmt.count)} 条` : '';
-    if (!cmtListEl.children.length) cmtListEl.innerHTML = '<div class="cmt-empty">还没有人评论</div>';
-    more.hidden = cmt.end;
-    more.textContent = '加载更多';
+    if (reset) {
+      // 只有首屏值得缓存（翻页是用户主动点的，缓存了反而占内存）
+      cmtPage1.set(`${cmt.bvid}|${cmt.sort}`, { data: j, ts: Date.now() });
+      if (cmtPage1.size > 30) cmtPage1.delete(cmtPage1.keys().next().value);
+    }
   } catch (e) {
     if (token !== cmt.token) return;
     if (reset) cmtListEl.innerHTML = '';
@@ -3491,9 +3669,16 @@ function startComments(bvid) {
   // 作废还在飞的请求：换歌 / 换排序时不能等它，否则会贴上去上一批评论
   cmt.loading = false;
   cmt.token++;
+  $('#cmtOpenBili').href = `https://www.bilibili.com/video/${encodeURIComponent(bvid)}`;
+
+  const hit = cmtPage1.get(`${bvid}|${cmt.sort}`);
+  if (hit && Date.now() - hit.ts < CMT_CACHE_TTL) {
+    paintCommentsPage(hit.data, true); // 秒开，不再请求
+    return;
+  }
+
   cmtListEl.innerHTML = '<div class="cmt-empty">正在加载评论…</div>';
   $('#cmtCount').textContent = '';
-  $('#cmtOpenBili').href = `https://www.bilibili.com/video/${encodeURIComponent(bvid)}`;
   loadComments(true);
 }
 
@@ -4026,7 +4211,7 @@ function restoreLast() {
     const cover = t.cover ? imgUrl(t.cover, '@200w_200h_1c') : '';
     $('#npCover').style.backgroundImage = cover ? `url('${cover}')` : '';
     $('#npTitle').textContent = t.title;
-    $('#npUpper').textContent = t.upper || '—';
+    refreshNowPlayingMeta();
     refreshActiveUI();
 
     const pos = last && last.bvid === bvid ? Number(last.pos) || 0 : 0;

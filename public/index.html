@@ -119,6 +119,12 @@
             <rect x="13.1" y="12.6" width="7.4" height="7.4" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.9"/>
           </svg>
         </button>
+        <button id="settingsBtn" class="icon-btn" title="设置">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+            <path d="M4 7h7M15.5 7H20M4 12h2.5M11 12h9M4 17h7M15.5 17H20"/>
+            <circle cx="13" cy="7" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="13" cy="17" r="2"/>
+          </svg>
+        </button>
         <button id="themeBtn" class="icon-btn theme-btn" title="切换到白天主题">
           <svg class="theme-sun" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
             <circle cx="12" cy="12" r="4.2" fill="none" stroke="currentColor" stroke-width="2"/>
@@ -151,7 +157,7 @@
         <span class="col-idx">#</span>
         <span class="col-title">歌曲</span>
         <span class="col-upper">UP 主</span>
-        <span class="col-br">音质</span>
+        <span class="col-br">码率</span>
         <span class="col-time">时长</span>
       </div>
       <div id="trackList" class="track-list" role="list"></div>
@@ -297,7 +303,10 @@
 
     <div class="np-info">
       <h2 id="npBigTitle">未在播放</h2>
-      <p id="npBigUpper">—</p>
+      <p class="np-sub">
+        <span id="npBigUpper">—</span>
+        <span id="npBigBr" class="np-br" hidden>—</span>
+      </p>
     </div>
 
     <div class="np-progress-row">
@@ -461,6 +470,33 @@
   <div class="um-foot">
     <button id="userAdd" class="um-btn" type="button">+ 添加账号</button>
     <button id="userLogout" class="um-btn um-danger" type="button">退出登录</button>
+  </div>
+</div>
+
+<!-- ============ 设置 ============ -->
+<div id="setMenu" class="set-menu" hidden role="dialog" aria-label="设置">
+  <div class="set-head">设置</div>
+
+  <div class="set-row">
+    <div class="set-text">
+      <span class="set-name">放大视图默认显示</span>
+      <span class="set-hint">点开正在播放那块时先显示什么</span>
+    </div>
+    <div class="seg" id="segView" role="group" aria-label="放大视图默认显示">
+      <button type="button" data-val="visual">可视化</button>
+      <button type="button" data-val="video">视频</button>
+    </div>
+  </div>
+
+  <div class="set-row">
+    <div class="set-text">
+      <span class="set-name">评论</span>
+      <span class="set-hint">放大时自动带出右侧评论区</span>
+    </div>
+    <div class="seg" id="segCmt" role="group" aria-label="评论默认开启">
+      <button type="button" data-val="1">开</button>
+      <button type="button" data-val="0">关</button>
+    </div>
   </div>
 </div>
 
