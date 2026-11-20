@@ -1044,6 +1044,237 @@ async function proxyAudio(req, res, bvid, cid) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 视频流 + 评论（放大视图里的「视频 / 评论」两个开关）                    */
+/*                                                                      */
+/* 视频为什么走 durl 而不是 dash：                                       */
+/*   dash 是「纯视频流 + 音轨」两条独立地址，一个视频被切成无数 .m4s 分片， */
+/*   浏览器原生 <video> 既拖不动也没声音，得引 MSE/flv.js 这套东西。       */
+/*   durl（platform=html5）是音视频混流的整段 mp4，原生 <video> 直接能播、 */
+/*   能任意拖进度条、还带声音；代价是画质封顶 720P —— 听歌场景完全够用。   */
+/* 声音仍然由 /api/audio 出（本地缓存 + 大码率），<video> 静音只为出画面。 */
+/* ------------------------------------------------------------------ */
+
+const videoSrcCache = new Map(); // bvid -> { urls, size, quality, label, cid, ts }
+const VIDEO_SRC_TTL = 20 * 60 * 1000;
+
+const QN_LABEL = {
+  127: '8K', 126: '杜比视界', 125: 'HDR', 120: '4K', 116: '1080P60', 112: '1080P+',
+  80: '1080P', 74: '720P60', 64: '720P', 32: '480P', 16: '360P', 6: '240P',
+};
+
+async function videoSource(bvid, cid, force = false) {
+  const hit = videoSrcCache.get(bvid);
+  if (!force && hit && Date.now() - hit.ts < VIDEO_SRC_TTL && (!cid || hit.cid === cid)) return hit;
+
+  let realCid = cid || (hit && hit.cid);
+  if (!realCid) realCid = (await resolveCid(bvid)).cid;
+
+  const url =
+    `https://api.bilibili.com/x/player/playurl?bvid=${encodeURIComponent(bvid)}&cid=${realCid}` +
+    '&qn=80&fnval=0&fnver=0&fourk=1&platform=html5&high_quality=1';
+  const j = await biliJson(url, await authHeaders());
+  if (j.code !== 0) throw new Error(j.message || `playurl 失败 ${j.code}`);
+
+  const durl = j.data && j.data.durl;
+  if (!Array.isArray(durl) || !durl.length) throw new Error('这条视频没有可直接播放的混流地址');
+
+  const first = durl[0];
+  const entry = {
+    urls: [first.url, ...(first.backup_url || [])].filter(Boolean),
+    cid: realCid,
+    size: Number(first.size) || 0,
+    quality: j.data.quality || 0,
+    label: QN_LABEL[j.data.quality] || '',
+    ts: Date.now(),
+  };
+  videoSrcCache.set(bvid, entry);
+  return entry;
+}
+
+/** 视频流代理：透传 Range，让 <video> 能拖进度条；不落盘（视频太大） */
+async function proxyVideo(req, res, bvid, cid) {
+  if (!/^BV[0-9A-Za-z]{8,12}$/.test(bvid)) return sendText(res, 400, 'bad bvid');
+
+  let src;
+  try {
+    src = await videoSource(bvid, cid);
+  } catch (e) {
+    return sendText(res, 502, '取视频流失败: ' + e.message);
+  }
+
+  const range = req.headers.range || '';
+  const attempt = async (urls) => {
+    let lastErr = null;
+    for (const u of urls) {
+      try {
+        const upstream = await fetch(u, {
+          headers: { ...BASE_HEADERS, Accept: '*/*', ...(range ? { Range: range } : {}) },
+          signal: AbortSignal.timeout(30000),
+        });
+        return upstream;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error('所有视频节点都连不上');
+  };
+
+  let up;
+  try {
+    up = await attempt(src.urls);
+    if (up.status === 403 || up.status === 410) {
+      // 地址过期 / 被 CDN 拒了，重取一次
+      src = await videoSource(bvid, cid, true);
+      up = await attempt(src.urls);
+    }
+  } catch (e) {
+    return sendText(res, 502, '视频节点不可达: ' + e.message);
+  }
+  if (up.status >= 400) return sendText(res, up.status, 'B站拒绝: ' + up.status);
+
+  const headers = {
+    'Content-Type': 'video/mp4',
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-store',
+  };
+  const len = up.headers.get('content-length');
+  const cr = up.headers.get('content-range');
+  if (len) headers['Content-Length'] = len;
+  if (cr) headers['Content-Range'] = cr;
+  res.writeHead(up.status, headers);
+
+  if (!up.body) return res.end();
+  const nodeStream = Readable.fromWeb(up.body);
+  nodeStream.on('error', () => res.destroy());
+  req.on('close', () => nodeStream.destroy());
+  nodeStream.pipe(res);
+}
+
+/* ---------------- 视频信息（评论要用 aid，顺带拿海报/简介/播放量） ---------------- */
+
+const videoInfoCache = new Map(); // bvid -> { data, ts }
+const VIDEO_INFO_TTL = 10 * 60 * 1000;
+
+async function videoInfo(bvid) {
+  const hit = videoInfoCache.get(bvid);
+  if (hit && Date.now() - hit.ts < VIDEO_INFO_TTL) return hit.data;
+
+  const j = await biliJson(
+    `https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(bvid)}`,
+    await authHeaders()
+  );
+  if (j.code !== 0) throw new Error(j.message || `view 失败 ${j.code}`);
+  const d = j.data || {};
+  const st = d.stat || {};
+  const data = {
+    bvid,
+    aid: d.aid,
+    cid: d.cid,
+    title: d.title || '',
+    desc: String(d.desc || '').slice(0, 500),
+    pic: d.pic || '',
+    duration: d.duration || 0,
+    pubdate: d.pubdate || 0,
+    owner: {
+      mid: (d.owner && d.owner.mid) || 0,
+      name: (d.owner && d.owner.name) || '',
+      face: (d.owner && d.owner.face) || '',
+    },
+    stat: {
+      view: st.view || 0,
+      danmaku: st.danmaku || 0,
+      reply: st.reply || 0,
+      like: st.like || 0,
+      coin: st.coin || 0,
+      favorite: st.favorite || 0,
+      share: st.share || 0,
+    },
+    pages: (d.pages || []).length,
+  };
+  videoInfoCache.set(bvid, { data, ts: Date.now() });
+  return data;
+}
+
+/* ---------------- 评论 ---------------- */
+
+/** B 站的评论是嵌套结构，这里压成前端好渲染的扁平对象 */
+function normReply(r) {
+  if (!r || !r.rpid) return null;
+  const m = r.member || {};
+  const c = r.content || {};
+
+  // 表情：评论正文里是 [doge] 这种文字码，emote 表里给的是图片地址
+  const emotes = {};
+  for (const [k, v] of Object.entries(c.emote || {})) {
+    const u = v && typeof v.url === 'string' ? v.url : '';
+    if (/^https?:\/\//i.test(u)) emotes[k] = u;
+    else if (u.startsWith('//')) emotes[k] = 'https:' + u;
+  }
+
+  return {
+    rpid: r.rpid,
+    like: r.like || 0,
+    ctime: r.ctime || 0,
+    mid: m.mid || 0,
+    uname: m.uname || '匿名用户',
+    face: m.avatar || '',
+    up: !!(m.is_up_member || (r.up_action && r.up_action.like)),
+    msg: String(c.message || ''),
+    emotes,
+    pics: (c.pictures || []).map((p) => p && p.img_src).filter(Boolean).slice(0, 3),
+    rcount: r.rcount || 0,
+    subs: (r.replies || []).slice(0, 3).map(normReply).filter(Boolean),
+  };
+}
+
+/**
+ * 一页评论。sort = hot（最热）/ new（最新）。
+ * 翻页用 B 站的游标：第一页 offset 传空，之后传上一页给的 next。
+ *
+ * 注意：这个接口对 buvid Cookie 很敏感 —— 带上 buvid3/buvid4 后只回 3 条
+ * 「最热」就 is_end=true 草草收尾（实测），所以这里专走完全匿名的请求。
+ * 评论本来也不需要登录态。
+ */
+async function biliJsonAnon(url) {
+  const res = await fetch(url, { headers: BASE_HEADERS, signal: AbortSignal.timeout(15000) });
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`B站接口返回非 JSON（HTTP ${res.status}），大概率触发了风控`);
+  }
+}
+
+async function videoComments(bvid, sort, offset) {
+  const info = await videoInfo(bvid);
+  const mode = sort === 'new' ? 2 : 3;
+  let url =
+    `https://api.bilibili.com/x/v2/reply/main?type=1&oid=${info.aid}&mode=${mode}&ps=20&plat=1`;
+  if (offset) url += `&pagination_str=${encodeURIComponent(JSON.stringify({ offset }))}`;
+
+  const j = await biliJsonAnon(url);
+  if (j.code !== 0) throw new Error(j.message || `评论接口失败 ${j.code}`);
+
+  const d = j.data || {};
+  const cursor = d.cursor || {};
+  const replies = (d.replies || []).map(normReply).filter(Boolean);
+
+  // 置顶评论 / UP 主自己的评论只出现在第一页
+  let top = [];
+  if (!offset && d.top) {
+    top = [d.top.upper, d.top.admin].map(normReply).filter(Boolean);
+  }
+
+  return {
+    count: cursor.all_count || (info.stat && info.stat.reply) || 0,
+    next: (cursor.pagination_reply && cursor.pagination_reply.next_offset) || '',
+    isEnd: !!cursor.is_end || !replies.length,
+    top,
+    replies,
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* 图片代理                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -2290,6 +2521,41 @@ async function route(req, res, url) {
 
     if (pathname === '/api/audio') {
       return await proxyAudio(req, res, (searchParams.get('bvid') || '').trim(), Number(searchParams.get('cid')) || 0);
+    }
+
+    if (pathname === '/api/video/info') {
+      const bvid = (searchParams.get('bvid') || '').trim();
+      if (!/^BV[0-9A-Za-z]{8,12}$/.test(bvid)) return sendJson(res, 400, { ok: false, error: 'bvid 不合法' });
+      try {
+        const info = await videoInfo(bvid);
+        let stream = { available: false };
+        try {
+          const src = await videoSource(bvid, info.cid);
+          stream = { available: true, quality: src.quality, label: src.label, size: src.size };
+        } catch (e) {
+          stream = { available: false, reason: e.message || String(e) };
+        }
+        return sendJson(res, 200, { ok: true, ...info, stream });
+      } catch (e) {
+        return sendJson(res, 502, { ok: false, error: e.message || String(e), code: e.code });
+      }
+    }
+
+    if (pathname === '/api/video/stream') {
+      return await proxyVideo(req, res, (searchParams.get('bvid') || '').trim(), Number(searchParams.get('cid')) || 0);
+    }
+
+    if (pathname === '/api/video/comments') {
+      const bvid = (searchParams.get('bvid') || '').trim();
+      if (!/^BV[0-9A-Za-z]{8,12}$/.test(bvid)) return sendJson(res, 400, { ok: false, error: 'bvid 不合法' });
+      const sort = searchParams.get('sort') === 'new' ? 'new' : 'hot';
+      const offset = (searchParams.get('next') || '').trim().slice(0, 200);
+      try {
+        const data = await videoComments(bvid, sort, offset);
+        return sendJson(res, 200, { ok: true, sort, ...data });
+      } catch (e) {
+        return sendJson(res, 502, { ok: false, error: e.message || String(e), code: e.code });
+      }
     }
 
     if (pathname === '/api/img') {

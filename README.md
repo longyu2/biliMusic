@@ -19,6 +19,7 @@
 - 三种播放模式：列表循环、单曲循环、乱序
 - **乱序是「一次性洗牌」**：整张列表洗一次牌后按顺序播完，一轮之内不重复；播完一轮才重新洗牌，且刚播完那首会被钉在队首，所以「上一首」永远能退回刚才实际播的那首
 - 单曲大图视图：圆形封面 + **环形音频频谱**（Web Audio `AnalyserNode` 实时驱动）
+- **放大视图里的「视频」和「评论」**：点底栏正在播放的那块（或右键任意一首 → 看视频 / 评论）展开后，左上角两个开关——`视频` 把唱片封面换成 720P 画面，`评论` 拉出右侧评论区抽屉（最热 / 最新、表情、图片、楼中楼、加载更多）。声音始终走 `/api/audio` 那条本地缓存，画面静音只负责播，所以进度条 / 上一首下一首 / 音量 / 频谱全都照旧
 
 **多端**
 
@@ -198,6 +199,22 @@ GET /api/audio?bvid=BV1xxxxxxx
   → 带 Referer 代理转发
 ```
 
+### 视频为什么走 durl 而不是 dash
+
+```
+GET /api/video/stream?bvid=BV1xxxxxxx&cid=
+  → player/playurl?qn=80&fnval=0&platform=html5   (要的是 durl，不是 dash)
+  → 拿到一条音视频混流的整段 mp4
+  → 带上 Referer + 原样透传 Range 转发给 <video>
+```
+
+- `dash` 是「纯视频流 + 独立音轨」，一个视频被切成成百上千个 `.m4s` 分片，浏览器原生 `<video>` 既拖不动、也没声音，要引 MSE（flv.js / dash.js）那一整套
+- `durl`（`platform=html5`）是音视频混流的整段 mp4，`ftypisom` 开头、支持 `Range`，原生 `<video>` 直接能播能拖；代价是画质封顶 720P
+- 画质不是重点时这样最省事：**声音还是走 `/api/audio`**（本地磁盘缓存 + 最高码率），`<video>` 只是静音出画面，所以 `audio` 一直是进度/播放/音量的唯一真源
+- 画面跟音频对齐靠两条：切歌、拖进度条时直接 `video.currentTime = audio.currentTime`；平时在 `timeupdate` 里量偏差，超过 80ms 就用 `playbackRate = 1.1 / 0.9` 追（画面静音，改速率听不出来）。实测稳定在 **70ms** 以内
+
+**评论**翻页用 B 站的游标：第一页不带 `pagination_str`，之后把上一页 `cursor.pagination_reply.next_offset` 塞进 `pagination_str={"offset":"..."}`。注意这个接口**不能带 buvid Cookie** —— 带上 `buvid3/buvid4` 只会回 3 条「最热」就 `is_end=true` 收尾（实测），所以 `biliJsonAnon()` 专走完全匿名的请求。
+
 ### 环形频谱
 
 `AnalyserNode` 的 `fftSize` 设成 256，得到 128 个 bin（每 bin 约 172Hz）。B 站的 AAC 在 16kHz 以上基本没有信号，所以只映射到前 62% 的 bin，剩下的死区不参与，否则半边频谱永远是平的。
@@ -234,6 +251,9 @@ const target = raw < 0.85 ? raw : 0.85 + (1 - Math.exp(-(raw - 0.85) * 2.2)) * 0
 | `POST` | `/api/fav/add` | 收藏到自己的收藏夹 `{ bvid, avid, folderId }`（需登录，走 `x/v3/fav/resource/deal`） |
 | `POST` | `/api/fav/folder/add` | 在自己的账号下新建收藏夹 `{ title, privacy }`（需登录，走 `x/v3/fav/folder/add`） |
 | `GET` | `/api/audio?bvid=&cid=` | 音频流代理（支持 Range / 206） |
+| `GET` | `/api/video/info?bvid=` | 视频信息 + 可否播放（`{ aid, cid, title, desc, stat, stream:{ available, quality, label, size } }`，内存缓存 10 分钟） |
+| `GET` | `/api/video/stream?bvid=&cid=` | 视频流代理（durl 混流 mp4，透传 Range / 206，不落盘） |
+| `GET` | `/api/video/comments?bvid=&sort=hot\|new&next=` | 评论一页（20 条，含置顶 / UP 主、楼中楼前 3 条、表情表；`next` 传上一页给的游标） |
 | `GET` | `/api/img?u=` | 封面图代理（磁盘缓存） |
 | `GET` | `/api/progress` | 播放进度（`?bvid=` 查单首） |
 | `POST` | `/api/progress` | 上报进度 `{ bvid, pos, dur, mediaId }` |
@@ -313,7 +333,8 @@ npm run dist       # 打包出 NSIS 安装版 + 便携版
 | `M` | 静音 |
 | `N` / `P` | 下一首 / 上一首 |
 | `Esc` | 收起单曲大图 / 退出搜索视图 |
-| 右键曲目 | 添加到收藏夹 / 在浏览器打开 B 站原视频 |
+| `V` / `C` | 放大视图里开关「视频」/「评论」 |
+| 右键曲目 | 添加到收藏夹 / 看视频 / 在浏览器打开 B 站原视频 |
 
 ---
 
@@ -324,6 +345,9 @@ npm run dist       # 打包出 NSIS 安装版 + 便携版
 - 失效稿件（`dead`）会在列表里标灰并自动跳过
 - 音频直链有时效，长时间挂着可能需要切下一首重新解析
 - 悬浮卡片仅桌面端可用，纯浏览器打开时按钮不显示
+- 视频最高 **720P**：走的是 B 站 `platform=html5` 的 durl（音视频混流 mp4），好处是浏览器原生就能播、能拖、还带声音；1080P 只有 DASH 分片，纯 `<video>` 拖不动，得引 MSE，所以没做
+- 看视频时每条视频会额外走一遍完整流量（不落盘，几十 MB 一条）；只听歌不进「视频」模式就一点不耗
+- 评论区是**只读**的：能看最热 / 最新、表情、图片、楼中楼，不能发评论 / 点赞
 
 ## License
 

@@ -1797,6 +1797,300 @@ html[data-theme="light"] .search-pager {
 
 .np-play { width: 62px; height: 62px; }
 
+/* ============ 放大视图：视频 / 评论 ============ */
+
+/* 顶部左侧的两个开关 */
+.np-toolbar {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  z-index: 6;
+  display: flex;
+  gap: 8px;
+}
+
+.np-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(8px);
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.np-pill:hover { background: rgba(255, 255, 255, 0.15); color: #fff; }
+.np-pill.on { background: var(--pink); border-color: transparent; color: #fff; }
+
+/* 视频模式：圆形封面换成 16:9 画面，内容区放宽 */
+.np-view.video-mode .np-art { display: none; }
+.np-view.video-mode .np-inner { width: min(980px, 94vw); }
+
+.np-video {
+  position: relative;
+  width: min(88vw, 980px, calc((100vh - 330px) * 16 / 9));
+  aspect-ratio: 16 / 9;
+  border-radius: 14px;
+  overflow: hidden;
+  background: #000;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.6);
+}
+
+.np-video video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+  background: #000;
+  cursor: pointer;
+}
+
+.np-video-tip {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 0 22px;
+  text-align: center;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.62);
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.np-video-btn {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  color: rgba(255, 255, 255, 0.85);
+  background: rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.np-video:hover .np-video-btn { opacity: 1; }
+.np-video-btn:hover { background: rgba(0, 0, 0, 0.72); color: #fff; }
+
+/* ---- 评论区抽屉 ---- */
+.cmt-panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 5;
+  width: min(390px, 94vw);
+  display: flex;
+  flex-direction: column;
+  background: rgba(13, 15, 21, 0.88);
+  backdrop-filter: blur(20px) saturate(1.15);
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: -22px 0 60px rgba(0, 0, 0, 0.45);
+  animation: cmtIn 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes cmtIn {
+  from { transform: translateX(28px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+
+.cmt-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 16px 10px;
+}
+
+.cmt-title { font-size: 14.5px; font-weight: 600; }
+
+.cmt-count { font-size: 12px; color: rgba(255, 255, 255, 0.45); }
+
+.cmt-x {
+  margin-left: auto;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: rgba(255, 255, 255, 0.6);
+  transition: background 0.15s, color 0.15s;
+}
+
+.cmt-x:hover { background: rgba(255, 255, 255, 0.12); color: #fff; }
+
+.cmt-sorts {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 16px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.cmt-sort {
+  height: 26px;
+  padding: 0 11px;
+  border-radius: 999px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.6);
+  background: rgba(255, 255, 255, 0.06);
+  transition: 0.15s;
+}
+
+.cmt-sort:hover { color: #fff; }
+.cmt-sort.active { background: rgba(255, 255, 255, 0.16); color: #fff; }
+
+.cmt-open {
+  margin-left: auto;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.42);
+}
+
+.cmt-open:hover { color: var(--pink); }
+
+.cmt-list {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px 16px 8px;
+}
+
+.cmt-item {
+  display: flex;
+  gap: 10px;
+  padding: 13px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.cmt-face {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.cmt-main { min-width: 0; flex: 1; }
+
+.cmt-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.cmt-name {
+  font-size: 12.5px;
+  color: rgba(255, 255, 255, 0.72);
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cmt-badge {
+  font-size: 9.5px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 3px;
+  color: #fff;
+  background: var(--pink);
+}
+
+.cmt-time { margin-left: auto; font-size: 11px; color: rgba(255, 255, 255, 0.32); }
+
+.cmt-msg {
+  font-size: 13px;
+  line-height: 1.62;
+  color: rgba(255, 255, 255, 0.86);
+  word-break: break-word;
+}
+
+.cmt-emote {
+  width: 20px;
+  height: 20px;
+  vertical-align: -4px;
+  margin: 0 1px;
+}
+
+.cmt-pics { display: flex; gap: 6px; margin-top: 7px; flex-wrap: wrap; }
+
+.cmt-pic {
+  width: 78px;
+  height: 78px;
+  border-radius: 8px;
+  object-fit: cover;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.cmt-foot {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 7px;
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.38);
+}
+
+.cmt-like { display: inline-flex; align-items: center; gap: 4px; }
+.cmt-rc { color: rgba(255, 255, 255, 0.42); }
+
+.cmt-sub {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.045);
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.cmt-sub + .cmt-sub { margin-top: 5px; }
+.cmt-sub-name { color: rgba(255, 255, 255, 0.52); margin-right: 6px; }
+.cmt-sub-name .cmt-badge { margin-left: 3px; }
+
+.cmt-tops .cmt-item { background: rgba(251, 114, 153, 0.05); }
+
+.cmt-more {
+  flex: 0 0 auto;
+  height: 42px;
+  font-size: 12.5px;
+  color: rgba(255, 255, 255, 0.55);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  transition: background 0.15s, color 0.15s;
+}
+
+.cmt-more:hover { background: rgba(255, 255, 255, 0.05); color: #fff; }
+
+.cmt-empty {
+  padding: 26px 4px;
+  text-align: center;
+  font-size: 12.5px;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+/* 宽屏时内容整体左让，别被评论面板压住 */
+@media (min-width: 1120px) {
+  .np-view.cmt-open .np-inner { transform: translateX(-195px); }
+}
+
+/* 这几个元素靠 display:flex/grid 排版，[hidden] 得手动压回去 */
+.np-video[hidden],
+.np-video-tip[hidden],
+.cmt-panel[hidden],
+.cmt-more[hidden] { display: none !important; }
+
 /* 底栏「正在播放」可点击展开 */
 .now-playing {
   cursor: pointer;

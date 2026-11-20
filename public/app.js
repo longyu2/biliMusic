@@ -1100,7 +1100,9 @@ function showContextMenu(x, y, opts) {
   const favItem = menu.querySelector('[data-action="add-fav"]');
   const moveItem = menu.querySelector('[data-action="move-fav"]');
   const seasonItem = menu.querySelector('[data-action="import-season"]');
+  const videoItem = menu.querySelector('[data-action="open-video"]');
   if (biliItem) biliItem.hidden = !bvid;
+  if (videoItem) videoItem.hidden = !showFav;
   if (miniItem) miniItem.hidden = !showMini;
   if (favItem) favItem.hidden = !showFav;
   if (moveItem) moveItem.hidden = !showMove;
@@ -1135,6 +1137,20 @@ function initContextMenu() {
     if (action === 'open-bili' && bvid) {
       // 桌面端由主进程 setWindowOpenHandler 转给系统浏览器
       window.open(`https://www.bilibili.com/video/${encodeURIComponent(bvid)}`, '_blank', 'noopener');
+    } else if (action === 'open-video' && track) {
+      // 直接进放大视图的「视频 + 评论」模式
+      if (!currentTrack() || currentTrack().bvid !== track.bvid) {
+        // 不是当前在播的这首：先播它，再开视频
+        const idx = state.tracks.findIndex((x) => x.bvid === track.bvid);
+        if (idx >= 0 && !state.tracks[idx].dead) playAt(idx);
+        else {
+          state.queue = [{ ...track }];
+          queuePlayAt(0);
+        }
+      }
+      openNp();
+      setVideoMode(true);
+      openComments();
     } else if (action === 'open-mini' && DESKTOP) {
       DESKTOP.openMini();
     } else if (action === 'add-fav') {
@@ -2778,6 +2794,15 @@ document.addEventListener('keydown', (e) => {
     case 'Q':
       toggleQueuePanel();
       break;
+    case 'v':
+    case 'V':
+      // 只在放大视图里生效，免得在列表页误触
+      if (!npView.hidden) setVideoMode(!videoMode);
+      break;
+    case 'c':
+    case 'C':
+      if (!npView.hidden) (cmt.open ? hideComments() : openComments());
+      break;
     default:
       break;
   }
@@ -3122,6 +3147,10 @@ function renderNp() {
   $('#npBigTitle').textContent = t.title;
   $('#npBigUpper').textContent = t.upper || '—';
   updateProgressUI(audio.currentTime, totalDuration());
+
+  // 开着视频 / 评论面板时切歌，两个面板都跟着换内容
+  if (videoMode && videoWant !== t.bvid) loadVideo(t);
+  if (cmt.open && cmt.bvid !== t.bvid) startComments(t.bvid);
 }
 
 function openNp() {
@@ -3137,6 +3166,9 @@ function openNp() {
 
 function closeNp() {
   if (npView.hidden) return;
+  // 关掉放大视图就停止拉视频（几十 MB 一条，别在后台偷流量）
+  if (videoMode) setVideoMode(false);
+  hideComments();
   npView.hidden = true;
   stopViz();
 }
@@ -3163,6 +3195,337 @@ window.addEventListener('pagehide', () => {
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') reportProgress(true);
+});
+
+/* ---------------- 放大视图里的「视频」和「评论」 ---------------- */
+
+/**
+ * 视频只出画面，声音还是 /api/audio 那条（本地缓存、大码率）。
+ * 好处是：进度条 / 上一首下一首 / 音量 / 频谱全都不用改，audio 永远是唯一的「表」。
+ * 代价是画面得自己跟 audio 对齐，所以下面有 seekVideoHard / syncVideoDrift。
+ */
+
+const npVideoBox = $('#npVideo');
+const npVideoEl = $('#npVideoEl');
+const npVideoTip = $('#npVideoTip');
+const cmtPanel = $('#cmtPanel');
+const cmtListEl = $('#cmtList');
+
+let videoMode = false; // 画面开关
+let videoWant = ''; // 正在为哪首加载（防止切歌后旧请求把画面贴错）
+let videoReady = false;
+
+const cmt = { open: false, sort: 'hot', next: '', bvid: '', loading: false, end: false, count: 0, token: 0 };
+
+function npVideoReset(tip) {
+  videoReady = false;
+  videoWant = '';
+  npVideoBox.classList.remove('ready');
+  npVideoTip.hidden = false;
+  npVideoTip.textContent = tip || '';
+  try {
+    npVideoEl.pause();
+    npVideoEl.removeAttribute('src');
+    npVideoEl.load();
+  } catch {}
+}
+
+function setVideoMode(on) {
+  const t = currentTrack();
+  if (on && !t) {
+    toast('还没有在播放的歌', 1800);
+    return;
+  }
+  videoMode = !!on;
+  npView.classList.toggle('video-mode', videoMode);
+  $('#npVideoBtn').classList.toggle('on', videoMode);
+  npVideoBox.hidden = !videoMode;
+  if (!videoMode) {
+    npVideoReset('正在获取视频…');
+    return;
+  }
+  loadVideo(t);
+}
+
+async function loadVideo(t) {
+  if (!t || !t.bvid) return;
+  videoWant = t.bvid;
+  videoReady = false;
+  npVideoBox.classList.remove('ready');
+  npVideoTip.hidden = false;
+  npVideoTip.textContent = '正在获取视频…';
+
+  try {
+    const j = await api(`/api/video/info?bvid=${encodeURIComponent(t.bvid)}`);
+    if (videoWant !== t.bvid || !videoMode) return; // 已经切歌 / 已经关掉
+    if (!j || !j.ok) throw new Error((j && j.error) || '获取视频信息失败');
+    if (!j.stream || !j.stream.available) {
+      npVideoTip.textContent = '这条只有音频，没有能直接播的画面';
+      return;
+    }
+    npVideoTip.textContent = (j.stream.label ? j.stream.label + ' · ' : '') + '加载中…';
+    npVideoEl.src = `/api/video/stream?bvid=${encodeURIComponent(t.bvid)}&cid=${encodeURIComponent(j.cid || '')}`;
+    npVideoEl.load();
+    whenVideoReady(() => {
+      if (videoWant !== t.bvid || !videoMode) return;
+      videoReady = true;
+      npVideoBox.classList.add('ready');
+      npVideoTip.hidden = true;
+      seekVideoHard();
+      if (!audio.paused) {
+        npVideoEl.play().catch(() => {});
+        // 起播会慢半拍（要等缓冲 / 落到关键帧），起来后再对一次表
+        setTimeout(() => {
+          if (videoMode && videoReady && videoWant === t.bvid) seekVideoHard();
+        }, 600);
+      }
+    });
+  } catch (e) {
+    if (videoWant === t.bvid) npVideoTip.textContent = '视频加载失败：' + (e.message || e);
+  }
+}
+
+function whenVideoReady(fn) {
+  if (npVideoEl.readyState >= 1) {
+    fn();
+    return;
+  }
+  npVideoEl.addEventListener('loadedmetadata', fn, { once: true });
+}
+
+/** 直接把画面拽到音频的位置（切歌 / 拖动进度条 / 偏差太大时用） */
+function seekVideoHard() {
+  npVideoEl.playbackRate = 1;
+  if (!videoReady) return;
+  const target = audio.currentTime || 0;
+  try {
+    if (Math.abs(npVideoEl.currentTime - target) > 0.12) npVideoEl.currentTime = target;
+  } catch {}
+}
+
+/**
+ * 画面比音频跑偏了就用微调播放速率追回来。
+ * 画面是静音的，改 playbackRate 只影响画面快慢，听不出破绽。
+ */
+function syncVideoDrift() {
+  if (!videoMode || !videoReady || npVideoEl.paused) return;
+  const d = npVideoEl.currentTime - audio.currentTime;
+  if (Math.abs(d) > 0.55) {
+    seekVideoHard();
+    return;
+  }
+  npVideoEl.playbackRate = Math.abs(d) > 0.08 ? (d > 0 ? 0.9 : 1.1) : 1;
+}
+
+$('#npVideoBtn').addEventListener('click', () => setVideoMode(!videoMode));
+$('#npVideoEl').addEventListener('click', togglePlay);
+$('#npVideoFs').addEventListener('click', () => {
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  else if (npVideoEl.requestFullscreen) npVideoEl.requestFullscreen().catch(() => {});
+  else npVideoEl.webkitEnterFullscreen && npVideoEl.webkitEnterFullscreen();
+});
+npVideoEl.addEventListener('error', () => {
+  if (!videoMode) return;
+  npVideoBox.classList.remove('ready');
+  npVideoTip.hidden = false;
+  npVideoTip.textContent = '视频加载失败，可能这条视频没有开放外链播放';
+});
+
+/* 跟着音频走：播放暂停、拖动、漂移 */
+audio.addEventListener('play', () => {
+  if (videoMode && videoReady) npVideoEl.play().catch(() => {});
+});
+audio.addEventListener('pause', () => {
+  if (videoMode && videoReady) npVideoEl.pause();
+});
+audio.addEventListener('seeked', () => {
+  if (videoMode) seekVideoHard();
+});
+audio.addEventListener('timeupdate', () => {
+  if (!videoMode) return;
+  if (npVideoEl.paused && !audio.paused) npVideoEl.play().catch(() => {});
+  syncVideoDrift();
+});
+
+/* ---------------- 评论 ---------------- */
+
+function fmtNum(n) {
+  n = Number(n) || 0;
+  if (n >= 1e8) return (n / 1e8).toFixed(1).replace(/\.0$/, '') + '亿';
+  if (n >= 1e4) return (n / 1e4).toFixed(1).replace(/\.0$/, '') + '万';
+  return String(n);
+}
+
+function fmtCmtTime(sec) {
+  const t = Number(sec) * 1000;
+  if (!t) return '';
+  const d = Date.now() - t;
+  if (d < 60000) return '刚刚';
+  if (d < 3600000) return Math.floor(d / 60000) + ' 分钟前';
+  if (d < 86400000) return Math.floor(d / 3600000) + ' 小时前';
+  if (d < 86400000 * 30) return Math.floor(d / 86400000) + ' 天前';
+  const dt = new Date(t);
+  const p = (x) => String(x).padStart(2, '0');
+  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}`;
+}
+
+function isSafeEmoteUrl(u) {
+  return /^https?:\/\/([a-z0-9-]+\.)*(hdslb\.com|biliimg\.com)\//i.test(u || '');
+}
+
+/** 评论正文：先转义，再把 [doge] 这类表情码换成图片 */
+function cmtText(r) {
+  let html = escapeHtml(r.msg || '').replace(/\n/g, '<br>');
+  const em = r.emotes || {};
+  for (const code of Object.keys(em)) {
+    const safe = escapeHtml(code);
+    if (!html.includes(safe)) continue;
+    const url = em[code];
+    if (!isSafeEmoteUrl(url)) continue;
+    const src = `/api/img?u=${encodeURIComponent(url)}`;
+    html = html.split(safe).join(`<img class="cmt-emote" src="${escapeAttr(src)}" alt="${safe}">`);
+  }
+  return html;
+}
+
+function renderComment(r) {
+  const face = r.face
+    ? `<img class="cmt-face" src="${escapeAttr(imgUrl(r.face, '@80w_80h_1c'))}" alt="" loading="lazy">`
+    : '<div class="cmt-face"></div>';
+
+  const pics = (r.pics || [])
+    .map((p) => `<img class="cmt-pic" src="${escapeAttr(imgUrl(p, '@200w_200h_1c'))}" alt="" loading="lazy">`)
+    .join('');
+
+  const subs = (r.subs || [])
+    .map(
+      (s) => `<div class="cmt-sub">
+        <span class="cmt-sub-name">${escapeHtml(s.uname)}${s.up ? ' <i class="cmt-badge">UP</i>' : ''}</span>
+        <span class="cmt-sub-msg">${cmtText(s)}</span>
+      </div>`
+    )
+    .join('');
+
+  return `<div class="cmt-item">
+    ${face}
+    <div class="cmt-main">
+      <div class="cmt-top">
+        <span class="cmt-name">${escapeHtml(r.uname)}</span>
+        ${r.up ? '<i class="cmt-badge">UP</i>' : ''}
+        <span class="cmt-time">${fmtCmtTime(r.ctime)}</span>
+      </div>
+      <div class="cmt-msg">${cmtText(r)}</div>
+      ${pics ? `<div class="cmt-pics">${pics}</div>` : ''}
+      <div class="cmt-foot">
+        <span class="cmt-like">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M2 11h3v9H2zM6.5 20V10.5L12 3l1.4 1.1c.5.4.7 1 .5 1.6L12.8 9h6.6c1.2 0 2 1.1 1.7 2.2l-2 7.3c-.2.9-1 1.5-1.9 1.5z"/></svg>
+          ${fmtNum(r.like)}
+        </span>
+        ${r.rcount ? `<span class="cmt-rc">${fmtNum(r.rcount)} 条回复</span>` : ''}
+      </div>
+      ${subs}
+    </div>
+  </div>`;
+}
+
+function appendComments(list, kind) {
+  if (!list.length) return;
+  const html = list.map((r) => renderComment(r)).join('');
+  if (kind === 'top') {
+    const box = document.createElement('div');
+    box.className = 'cmt-tops';
+    box.innerHTML = html;
+    cmtListEl.appendChild(box);
+    return;
+  }
+  cmtListEl.insertAdjacentHTML('beforeend', html);
+}
+
+async function loadComments(reset) {
+  if (!cmt.bvid || cmt.loading) return;
+  if (!reset && cmt.end) return;
+
+  const token = ++cmt.token;
+  cmt.loading = true;
+  const more = $('#cmtMore');
+  more.hidden = false;
+  more.textContent = reset ? '正在加载评论…' : '正在加载更多…';
+
+  try {
+    const q =
+      `/api/video/comments?bvid=${encodeURIComponent(cmt.bvid)}&sort=${cmt.sort}` +
+      (reset ? '' : `&next=${encodeURIComponent(cmt.next)}`);
+    const j = await api(q);
+    if (token !== cmt.token) return; // 又切歌 / 又换排序了，这次结果丢掉
+    if (!j || !j.ok) throw new Error((j && j.error) || '评论加载失败');
+
+    cmt.count = j.count || 0;
+    cmt.next = j.next || '';
+    cmt.end = !!j.isEnd || !cmt.next;
+
+    if (reset) cmtListEl.innerHTML = '';
+    appendComments(j.top || [], 'top');
+    appendComments(j.replies || [], 'more');
+
+    $('#cmtCount').textContent = cmt.count ? `${fmtNum(cmt.count)} 条` : '';
+    if (!cmtListEl.children.length) cmtListEl.innerHTML = '<div class="cmt-empty">还没有人评论</div>';
+    more.hidden = cmt.end;
+    more.textContent = '加载更多';
+  } catch (e) {
+    if (token !== cmt.token) return;
+    if (reset) cmtListEl.innerHTML = '';
+    const err = document.createElement('div');
+    err.className = 'cmt-empty';
+    err.textContent = e.message || String(e);
+    cmtListEl.appendChild(err);
+    more.hidden = true;
+  } finally {
+    if (token === cmt.token) cmt.loading = false;
+  }
+}
+
+function startComments(bvid) {
+  cmt.bvid = bvid;
+  cmt.next = '';
+  cmt.end = false;
+  cmtListEl.innerHTML = '<div class="cmt-empty">正在加载评论…</div>';
+  $('#cmtCount').textContent = '';
+  $('#cmtOpenBili').href = `https://www.bilibili.com/video/${encodeURIComponent(bvid)}`;
+  loadComments(true);
+}
+
+function openComments() {
+  const t = currentTrack();
+  if (!t) {
+    toast('还没有在播放的歌', 1800);
+    return;
+  }
+  cmt.open = true;
+  cmtPanel.hidden = false;
+  npView.classList.add('cmt-open');
+  $('#npCmtBtn').classList.add('on');
+  if (cmt.bvid !== t.bvid) startComments(t.bvid);
+}
+
+/** 只收起面板，列表留着；关掉放大视图时用 */
+function hideComments() {
+  cmt.open = false;
+  cmtPanel.hidden = true;
+  npView.classList.remove('cmt-open');
+  $('#npCmtBtn').classList.remove('on');
+}
+
+$('#npCmtBtn').addEventListener('click', () => (cmt.open ? hideComments() : openComments()));
+$('#cmtClose').addEventListener('click', hideComments);
+$('#cmtMore').addEventListener('click', () => loadComments(false));
+document.querySelectorAll('.cmt-sort').forEach((b) => {
+  b.addEventListener('click', () => {
+    const sort = b.dataset.sort || 'hot';
+    if (cmt.sort === sort) return;
+    cmt.sort = sort;
+    document.querySelectorAll('.cmt-sort').forEach((x) => x.classList.toggle('active', x === b));
+    if (cmt.bvid) startComments(cmt.bvid);
+  });
 });
 
 /* ---------------- 添加收藏夹 ---------------- */
